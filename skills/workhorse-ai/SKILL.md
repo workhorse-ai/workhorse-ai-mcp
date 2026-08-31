@@ -19,6 +19,31 @@ full-text search. The server validates status transitions, so you never need —
 must never try — to write to the database by hand. Do not create task files in the
 project repository: state lives in the journal only.
 
+## Requirements
+
+This skill drives the **workhorse MCP server** — without it, none of the tools
+referenced below exist. If your agent has no `workhorse` server connected, add
+it first (or ask the user to):
+
+```json
+{ "mcpServers": { "workhorse": { "command": "npx", "args": ["-y", "workhorse-ai-mcp"] } } }
+```
+
+The server needs Node.js >= 22.5, stores data in `~/.workhorse-ai/journal.db`,
+and creates the database itself on first start. It also announces its protocol
+in the MCP `initialize` instructions, so the status machine below is always
+available to the agent even without this skill.
+
+Tool inventory (names may be prefixed by your client, e.g. `mcp__workhorse__*`):
+
+| Group | Tools |
+|---|---|
+| Registry | `resolve_project`, `register_project`, `list_projects` |
+| Task lifecycle | `draft_task`, `delegate`, `submit_report`, `accept`, `request_rework`, `mark_failed` |
+| Knowledge | `search_precedents`, `record_artifact`, `record_incident`, `list_artifacts` |
+| Overview | `get_task`, `list_tasks`, `link_tasks` |
+| Cloud (optional) | `connect`, `sync`, `inbox`, `take` |
+
 ## Roles
 
 | Stage | Who | Why |
@@ -32,6 +57,22 @@ project repository: state lives in the journal only.
 
 A one-to-three-line fix with a diagnosis already in hand is done inline:
 delegating costs more than the edit itself.
+
+The roles are **acts, not separate programs**. Any of these configurations
+works, as long as writing the code and accepting it stay separate acts:
+
+| Configuration | Orchestrator | Worker |
+|---|---|---|
+| Two CLIs | one agent (e.g. Claude Code) | another agent (e.g. a coding CLI) |
+| One CLI | the main session | a subagent it spawns |
+| Solo | the same single agent | the same single agent |
+
+In the **solo** configuration the invariant does not disappear — it becomes a
+guard against self-deception. The rule: *the report and the acceptance are
+separate acts with separate evidence*. Set `REPORTED` when the work seems done;
+`ACCEPTED` only after a fresh, complete test run over the final state of the
+code, a line-by-line diff review against the assignment, and a `verify_commit`.
+"I just wrote this myself" is never evidence.
 
 ## Statuses and the key invariant
 
@@ -88,7 +129,7 @@ creates a new version, the old one stays in history.
 
    If the worker must judge something on its own, give it a stopping criterion
    ("found a consumer → do not delete, report back").
-4. **`delegate`** (plus launching the worker). The worker's prompt carries: the
+4. **`delegate`** (plus starting the worker — another CLI, a subagent, or, in the solo configuration, simply switching hats). The worker's prompt carries: the
    `task_id`, the assignment text, and three journal duties — `search_precedents`
    before starting; progress along the way via `record_artifact` (kind `note`, bound
    to `task_id`, with a stable `title` such as `progress: <slug>`, which versions

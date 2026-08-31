@@ -12,6 +12,36 @@ The journal enforces a simple discipline: `DRAFT → DELEGATED → REPORTED →
 ACCEPTED | REWORK | FAILED`, where *reported* (the worker thinks it is done)
 is never the same as *accepted* (the orchestrator verified it).
 
+## Quick start
+
+**Claude Code — two commands** (installs the MCP server *and* the skill):
+
+```bash
+claude plugin marketplace add https://github.com/workhorse-ai/workhorse-ai-mcp
+claude plugin install workhorse-ai@workhorse-ai
+```
+
+**Any other agent** — install the skill, then add the MCP server to your
+agent's MCP config:
+
+```bash
+npx skills add workhorse-ai/workhorse-ai-mcp
+```
+
+```json
+{ "mcpServers": { "workhorse": { "command": "npx", "args": ["-y", "workhorse-ai-mcp"] } } }
+```
+
+Optionally, pin the rule at the project level — copy this into your
+`AGENTS.md` / `CLAUDE.md`:
+
+```markdown
+Delegation goes through the `workhorse` MCP journal. Worker duties:
+`search_precedents` before starting, `record_artifact` (progress notes)
+along the way, `submit_report` at the end. Never commit and never accept
+your own work — acceptance requires the orchestrator's own test run.
+```
+
 ## Install
 
 Add the server to your `.mcp.json`:
@@ -45,25 +75,6 @@ On first start the server creates the directory and the database itself.
 `sync.json` always sits next to the database.
 
 ## Connect to the cloud (optional)
-
-The journal works fully offline. To sync it with a Planado workspace, issue
-an MCP token on the workspace's MCP page and ask your agent to call the
-`connect` tool:
-
-```json
-connect {
-  "url": "https://<your-workspace>/api/mcp/journal-sync",
-  "token": "<mcp token>"
-}
-```
-
-`connect` verifies the connection first and only then writes `sync.json`
-next to the database — no manual configuration. The journal id defaults to
-a normalized `<username>-<hostname>`. After that, every journal write is
-auto-pushed; `sync` forces a push, and `inbox`/`take` pull task intents
-from the cloud.
-
-## Connecting to a cloud
 
 `connect` needs only a token — the managed Workhorse AI cloud is the default:
 
