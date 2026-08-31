@@ -846,7 +846,7 @@ function handle(msg) {
 			respond(id, {
 				protocolVersion: params?.protocolVersion ?? "2024-11-05",
 				capabilities: { tools: {}, prompts: {} },
-				serverInfo: { name: "workhorse-mcp", version: "0.7.5" },
+				serverInfo: { name: "workhorse-mcp", version: "0.7.6" },
 				instructions: SERVER_INSTRUCTIONS,
 			});
 		} else if (method === "prompts/list") {
