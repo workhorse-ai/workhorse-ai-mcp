@@ -200,10 +200,10 @@ test("draft_task: guards id и slug", async (t) => {
 	assert.match(r.data.task_id, /^test\/\d{4}-\d{2}-\d{2}-auto-id$/, "id собран из project/даты/slug");
 
 	r = await c.tool("draft_task", {
-		task_id: "planado/чужой-неймспейс", project: "dom-pro", title: "т", task_text: "x",
+		task_id: "other-project/чужой-неймспейс", project: "demo-app", title: "т", task_text: "x",
 	});
 	assert.equal(r.ok, false, "id из чужого неймспейса отбивается");
-	assert.match(r.error, /должен начинаться с "dom-pro\/"/);
+	assert.match(r.error, /должен начинаться с "demo-app\/"/);
 
 	const id = "test/redraft";
 	await bringToReported(c, id);
@@ -269,7 +269,7 @@ test("артефакты: запись, версии, выборка, поиск
 
 	r = await c.tool("record_artifact", {
 		project: "workhorse", kind: "spec", title: "Формат журнала",
-		body: "версия 2: добавлены артефакты и маппинг на planado",
+		body: "версия 2: добавлены артефакты и маппинг на облако",
 	});
 	assert.ok(r.data.id > v1, "повторная запись = новая версия, старая остаётся");
 
@@ -295,8 +295,8 @@ test("артефакты: запись, версии, выборка, поиск
 	const full = await c.tool("get_artifact", { id: v1 });
 	assert.match(full.data.body, /event sourcing/);
 
-	r = await c.tool("search_precedents", { query: "маппинг planado" });
-	assert.ok(r.data.artifacts.some((a) => a.body_snippet.includes("[planado]")), "FTS по телу артефакта");
+	r = await c.tool("search_precedents", { query: "маппинг облако" });
+	assert.ok(r.data.artifacts.some((a) => a.body_snippet.includes("[облако]")), "FTS по телу артефакта");
 
 	const hist = await c.tool("get_task", { task_id: "test/linked" });
 	assert.ok(hist.data.events.some((e) => e.type === "ArtifactRecorded"), "событие в истории задачи");
@@ -333,7 +333,7 @@ test("связи задач: continues/discovered_from, guards", async (t) => {
 	assert.deepEqual(r.data.links.incoming, [{ from_task: newId, kind: "continues" }]);
 });
 
-test("реестр проектов: регистрация, guard, маппинг на planado", async (t) => {
+test("реестр проектов: регистрация, guard, маппинг на облако", async (t) => {
 	const c = startClient(t);
 
 	let r = await c.tool("draft_task", { project: "ghost", slug: "x", title: "т", task_text: "x" });
@@ -348,16 +348,16 @@ test("реестр проектов: регистрация, guard, маппин
 
 	r = await c.tool("register_project", { name: "demo", root_path: "/tmp/demo-v1" });
 	assert.equal(r.data.root_path, "/tmp/demo-v1");
-	assert.equal(r.data.planado_workspace_id, null);
+	assert.equal(r.data.cloud_workspace_id, null);
 
 	r = await c.tool("register_project", {
-		name: "demo", root_path: "/tmp/demo-v2", planado_workspace_id: "ws-123",
+		name: "demo", root_path: "/tmp/demo-v2", cloud_workspace_id: "ws-123",
 	});
 	assert.equal(r.data.root_path, "/tmp/demo-v2", "перерегистрация обновляет путь");
-	assert.equal(r.data.planado_workspace_id, "ws-123");
+	assert.equal(r.data.cloud_workspace_id, "ws-123");
 
 	r = await c.tool("register_project", { name: "demo", root_path: "/tmp/demo-v3" });
-	assert.equal(r.data.planado_workspace_id, "ws-123", "маппинг не затирается при обновлении пути");
+	assert.equal(r.data.cloud_workspace_id, "ws-123", "маппинг не затирается при обновлении пути");
 
 	r = await c.tool("draft_task", { project: "demo", slug: "works", title: "т", task_text: "x" });
 	assert.equal(r.data.status, "DRAFT", "после регистрации задачи принимаются");

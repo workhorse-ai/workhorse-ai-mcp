@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// workhorse-sync — пушер журнала в облако planado (шаг 2 спеки «Sync design»).
+// workhorse-sync — пушер журнала в облако Workhorse AI.
 // Направление строго вверх: GET курсор → POST батчи событий с seq > курсора.
 // Zero deps: node:sqlite (read-only) + встроенный fetch. Ошибки возвращаются
 // значением ({error}), исключения наружу не летят — пушер никогда не роняет журнал.

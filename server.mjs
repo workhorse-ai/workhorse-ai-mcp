@@ -218,14 +218,14 @@ const TOOLS = [
 		name: "register_project",
 		description:
 			"Зарегистрировать проект (событие ProjectRegistered): имя = неймспейс задач, root_path = " +
-			"привязка к папке на диске, planado_workspace_id = маппинг на пространство planado (опционально, позже). " +
+			"привязка к папке на диске, cloud_workspace_id = маппинг на пространство в облаке (опционально). " +
 			"Повторная регистрация обновляет путь/маппинг. Задачи и артефакты принимаются только для зарегистрированных проектов.",
 		inputSchema: {
 			type: "object",
 			properties: {
 				name: { type: "string", description: "Короткое имя (латиница/цифры/дефисы), напр. dom-pro" },
 				root_path: { type: "string", description: "Абсолютный путь к корню проекта" },
-				planado_workspace_id: { type: "string", description: "Id пространства planado (когда появится)" },
+				cloud_workspace_id: { type: "string", description: "Id пространства в облаке (опционально)" },
 				force: {
 					type: "boolean",
 					description: "Осознанно зарегистрировать несмотря на похожий проект (guard от почти-дублей)",
@@ -233,7 +233,7 @@ const TOOLS = [
 			},
 			required: ["name", "root_path"],
 		},
-		handler: ({ name, root_path, planado_workspace_id, force }) => {
+		handler: ({ name, root_path, cloud_workspace_id, force }) => {
 			if (!/^[a-z0-9-]+$/.test(name)) {
 				throw new Error("Имя проекта: латиница/цифры/дефисы — оно входит в task_id как неймспейс");
 			}
@@ -255,7 +255,7 @@ const TOOLS = [
 			appendEvent(
 				"_general",
 				"ProjectRegistered",
-				JSON.stringify({ name, root_path, planado_workspace_id: planado_workspace_id ?? null }),
+				JSON.stringify({ name, root_path, cloud_workspace_id: cloud_workspace_id ?? null }),
 			);
 			return getProjectStmt.get(name);
 		},
@@ -273,7 +273,7 @@ const TOOLS = [
 			},
 		},
 		handler: ({ path, name }) => {
-			const all = db.prepare("SELECT name, root_path, planado_workspace_id, at FROM projects").all();
+			const all = db.prepare("SELECT name, root_path, cloud_workspace_id, at FROM projects").all();
 			const byPath = path
 				? all.filter((p) => withSlash(path).startsWith(withSlash(p.root_path)) || pathsOverlap(p.root_path, path))
 				: [];
@@ -293,10 +293,10 @@ const TOOLS = [
 	},
 	{
 		name: "list_projects",
-		description: "Реестр проектов: имя, путь на диске, маппинг на пространство planado.",
+		description: "Реестр проектов: имя, путь на диске, маппинг на пространство в облаке.",
 		inputSchema: { type: "object", properties: {} },
 		handler: () =>
-			db.prepare("SELECT name, root_path, planado_workspace_id, at FROM projects ORDER BY name").all(),
+			db.prepare("SELECT name, root_path, cloud_workspace_id, at FROM projects ORDER BY name").all(),
 	},
 	{
 		name: "draft_task",
@@ -538,7 +538,7 @@ const TOOLS = [
 	{
 		name: "connect",
 		description:
-			"Подключить журнал к облаку planado: проверяет связь (GET курсора с токеном) и при успехе " +
+			"Подключить журнал к облаку Workhorse AI: проверяет связь (GET курсора с токеном) и при успехе " +
 			"сам пишет sync.json рядом с базой — ручная настройка не нужна. journal_id по умолчанию " +
 			"собирается из имени пользователя и машины. Повторный connect перезаписывает конфиг " +
 			"(осознанная смена воркспейса/токена). При ошибке связи конфиг не трогается.",
@@ -547,7 +547,7 @@ const TOOLS = [
 			properties: {
 				url: {
 					type: "string",
-					description: "URL синка воркспейса, напр. https://app.planado.ru/api/mcp/journal-sync",
+					description: "URL синка воркспейса, напр. https://<ваш-хост>/api/mcp/journal-sync",
 				},
 				token: { type: "string", description: "MCP-токен воркспейса (Bearer)" },
 				journal_id: {
@@ -606,7 +606,7 @@ const TOOLS = [
 	{
 		name: "sync",
 		description:
-			"Принудительно отправить журнал в облако planado (push, только вверх): GET курсор → " +
+			"Принудительно отправить журнал в облако (push, только вверх): GET курсор → " +
 			"POST события с seq > курсора. Конфиг: sync.json рядом с базой (url, token, journalId) " +
 			"либо env WORKHORSE_SYNC_URL/TOKEN/JOURNAL_ID. Без конфига синк выключен.",
 		inputSchema: { type: "object", properties: {} },
@@ -621,7 +621,7 @@ const TOOLS = [
 	{
 		name: "inbox",
 		description:
-			"Инбокс намерений из облака planado (pull: облако только отдаёт список, забирает оркестратор). " +
+			"Инбокс намерений из облака (pull: облако только отдаёт список, забирает оркестратор). " +
 			"Показывает предложенные Task-намерения с контекстом фичи. Конфиг — тот же, что у синка " +
 			"(sync.json / env), URL инбокса выводится из url синка. Забрать намерение — инструмент take.",
 		inputSchema: { type: "object", properties: {} },
@@ -769,7 +769,7 @@ const TOOLS = [
 const SERVER_INSTRUCTIONS = `Журнал делегирования оркестратор ↔ рабочая лошадка (event sourcing поверх SQLite).
 Статусы: DRAFT → DELEGATED → REPORTED → ACCEPTED | REWORK (→ DELEGATED…) | FAILED.
 Ключевой инвариант: REPORTED («исполнитель считает, что готово») ≠ ACCEPTED («оркестратор верифицировал»).
-Проекты регистрируются в реестре (register_project: имя-неймспейс + root_path + маппинг на пространство planado); задачи и артефакты принимаются только для зарегистрированных. Проект без workhorse — просто не регистрируй.
+Проекты регистрируются в реестре (register_project: имя-неймспейс + root_path + маппинг на пространство в облаке); задачи и артефакты принимаются только для зарегистрированных. Проект без workhorse — просто не регистрируй.
 ЖЁСТКОЕ PRECONDITION: без явного bootstrap'а (регистрация + артефакт "Project baseline: <project>" с базовой цифрой полного прогона тестов) на проекте не работать — ни draft_task, ни делегаций. Нет baseline — сначала промпт bootstrap, без исключений для «маленьких задач».
 Порядок: search_precedents (ОБЯЗАТЕЛЬНО до постановки) → record_artifact для спеки/плана/решения, если они рождались в обсуждении → draft_task (полный текст задания: контекст, root cause, порядок работ, запреты, формат отчёта) → delegate + запуск исполнителя (отчёт он пишет в файл, не в stdout) → submit_report → собственная верификация (дифф построчно, свой полный прогон тестов) → accept (только после зелёного прогона, с verify_commit) | request_rework | mark_failed → record_incident, если были грабли.
 Артефакты (spec/plan/adr/decision/note) — версионируемые: повторная запись с тем же title = новая версия. Значимое проектное решение из обсуждения фиксируется артефактом СРАЗУ — иначе оно умрёт с сессией.
@@ -846,7 +846,7 @@ function handle(msg) {
 			respond(id, {
 				protocolVersion: params?.protocolVersion ?? "2024-11-05",
 				capabilities: { tools: {}, prompts: {} },
-				serverInfo: { name: "workhorse-mcp", version: "0.7.6" },
+				serverInfo: { name: "workhorse-mcp", version: "0.8.0" },
 				instructions: SERVER_INSTRUCTIONS,
 			});
 		} else if (method === "prompts/list") {

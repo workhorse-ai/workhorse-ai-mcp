@@ -1,4 +1,4 @@
-// Тесты пушера синка workhorse → облако planado.
+// Тесты пушера синка workhorse → облако Workhorse AI.
 // Облако — in-process мок на node:http (контракт journal-sync: GET курсор,
 // POST батч, идемпотентность по seq, auth Authorization: Bearer <token>).
 // Никакой сети наружу: только 127.0.0.1 c портом от ОС.

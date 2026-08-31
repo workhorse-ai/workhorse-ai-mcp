@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS events (
                 'IncidentRecorded', -- payload: description, lesson
                 'ArtifactRecorded', -- payload: project, kind, title, body
                 'TaskLinked',       -- payload: to_task_id, kind
-                'ProjectRegistered' -- payload: name, root_path, planado_workspace_id
+                'ProjectRegistered' -- payload: name, root_path, cloud_workspace_id
             )),
     payload TEXT NOT NULL DEFAULT '{}',
     at      TEXT NOT NULL DEFAULT (datetime('now'))
@@ -104,12 +104,12 @@ CREATE TABLE IF NOT EXISTS incidents (
 );
 
 -- Реестр проектов: имя = неймспейс задач, root_path = привязка к папке на диске,
--- planado_workspace_id = маппинг на пространство planado (задачи/артефакты/доки
+-- cloud_workspace_id = маппинг на пространство в облаке Workhorse AI (задачи/артефакты/доки
 -- наследуют workspace через проект). Перерегистрация = обновление.
 CREATE TABLE IF NOT EXISTS projects (
     name                 TEXT PRIMARY KEY,
     root_path            TEXT,
-    planado_workspace_id TEXT,
+    cloud_workspace_id TEXT,
     at                   TEXT
 );
 
@@ -125,7 +125,7 @@ CREATE TABLE IF NOT EXISTS task_links (
 
 -- Артефакты: спеки, планы, ADR, решения, заметки. Append-only версии:
 -- повторная запись с тем же (project, kind, title) — новая версия, старая остаётся.
--- Маппинг на planado: spec/plan → Documentation, adr → Adr, note/decision → Thought.
+-- Маппинг на облако: spec/plan → Documentation, adr → Adr, note/decision → Thought.
 CREATE TABLE IF NOT EXISTS artifacts (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id TEXT,   -- опциональная привязка к задаче
@@ -210,14 +210,14 @@ END;
 CREATE TRIGGER IF NOT EXISTS evt_project_registered AFTER INSERT ON events
 WHEN NEW.type = 'ProjectRegistered'
 BEGIN
-    INSERT INTO projects(name, root_path, planado_workspace_id, at)
+    INSERT INTO projects(name, root_path, cloud_workspace_id, at)
     VALUES (json_extract(NEW.payload, '$.name'),
             json_extract(NEW.payload, '$.root_path'),
-            json_extract(NEW.payload, '$.planado_workspace_id'),
+            json_extract(NEW.payload, '$.cloud_workspace_id'),
             NEW.at)
     ON CONFLICT(name) DO UPDATE SET
         root_path            = excluded.root_path,
-        planado_workspace_id = coalesce(excluded.planado_workspace_id, planado_workspace_id),
+        cloud_workspace_id = coalesce(excluded.cloud_workspace_id, cloud_workspace_id),
         at                   = NEW.at;
 END;
 
