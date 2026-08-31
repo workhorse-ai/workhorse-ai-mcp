@@ -1,0 +1,41 @@
+{
+  "name": "workhorse-ai-mcp",
+  "version": "0.7.5",
+  "private": false,
+  "type": "module",
+  "description": "Delegation journal for orchestrator/worker AI workflows: event sourcing over SQLite with an MCP interface. Zero dependencies.",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "delegation",
+    "event-sourcing",
+    "sqlite",
+    "ai-agents",
+    "orchestration"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://gitlab.com/planado1/planado_app.git",
+    "directory": "apps/mcp"
+  },
+  "files": [
+    "server.mjs",
+    "sync.mjs",
+    "skills/",
+    "schema.sql",
+    "README.md",
+    "LICENSE"
+  ],
+  "bin": {
+    "workhorse-ai-mcp": "server.mjs",
+    "workhorse-mcp": "server.mjs",
+    "workhorse-sync": "sync.mjs"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}

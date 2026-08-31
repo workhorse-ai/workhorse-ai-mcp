@@ -1,0 +1,11 @@
+{
+  "name": "workhorse-ai",
+  "version": "0.7.5",
+  "description": "Delegation journal for orchestrator ↔ worker AI workflows: an MCP server over SQLite (event sourcing) plus the orchestration discipline skill. Key invariant: REPORTED (the worker believes it is done) ≠ ACCEPTED (the orchestrator verified it personally).",
+  "author": {
+    "name": "Aleksey Nikitin",
+    "email": "kvandake@gmail.com"
+  },
+  "homepage": "https://github.com/workhorse-ai/workhorse-ai-mcp",
+  "license": "MIT"
+}

@@ -1,0 +1,20 @@
+{
+  "name": "workhorse-ai",
+  "description": "Workhorse AI — the delegation journal and its orchestration discipline",
+  "owner": {
+    "name": "Aleksey Nikitin",
+    "email": "kvandake@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "workhorse-ai",
+      "version": "0.7.5",
+      "description": "Delegation journal (MCP over SQLite) plus the discipline skill: REPORTED ≠ ACCEPTED, mandatory bootstrap, acceptance proven by your own test run.",
+      "source": "./",
+      "author": {
+        "name": "Aleksey Nikitin",
+        "email": "kvandake@gmail.com"
+      }
+    }
+  ]
+}
