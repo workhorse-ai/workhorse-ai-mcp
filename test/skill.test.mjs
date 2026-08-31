@@ -1,4 +1,4 @@
-// Скилл оркестрации едет внутри пакета: файл на месте, frontmatter корректен,
+// Скиллы едут внутри пакета: все три на месте, frontmatter корректен,
 // каталог skills/ входит в files-whitelist (иначе npm его не упакует).
 
 import { test } from "node:test";
@@ -8,17 +8,26 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-const SKILL = join(ROOT, "skills", "workhorse-ai", "SKILL.md");
 
-test("скилл workhorse-ai лежит в пакете и попадает в npm-пакет", () => {
-	assert.equal(existsSync(SKILL), true, "skills/workhorse-ai/SKILL.md на месте");
+// Линейка: оркестратор / исполнитель / соло. Имена симметричны ролям.
+const SKILLS = ["workhorse-ai-orchestrator", "workhorse-ai-worker", "workhorse-ai-all"];
 
-	const text = readFileSync(SKILL, "utf8");
-	const frontmatter = text.match(/^---\n([\s\S]*?)\n---\n/);
-	assert.ok(frontmatter, "есть frontmatter");
-	assert.match(frontmatter[1], /^name: workhorse-ai$/m);
-	assert.match(frontmatter[1], /^description: .+/m);
-	assert.ok(text.includes("REPORTED"), "инвариант REPORTED != ACCEPTED описан");
+test("все три скилла лежат в пакете с корректным frontmatter", () => {
+	for (const name of SKILLS) {
+		const path = join(ROOT, "skills", name, "SKILL.md");
+		assert.equal(existsSync(path), true, `skills/${name}/SKILL.md на месте`);
+
+		const text = readFileSync(path, "utf8");
+		const frontmatter = text.match(/^---\n([\s\S]*?)\n---\n/);
+		assert.ok(frontmatter, `${name}: есть frontmatter`);
+		assert.match(frontmatter[1], new RegExp(`^name: ${name}$`, "m"));
+		assert.match(frontmatter[1], /^description: .+/m);
+		assert.ok(text.includes("REPORTED"), `${name}: инвариант REPORTED описан`);
+	}
+
+	// Исполнителю приёмка запрещена явно — это стержень инварианта.
+	const worker = readFileSync(join(ROOT, "skills", "workhorse-ai-worker", "SKILL.md"), "utf8");
+	assert.match(worker, /not.*call.*`accept`/i);
 
 	const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
 	assert.ok(

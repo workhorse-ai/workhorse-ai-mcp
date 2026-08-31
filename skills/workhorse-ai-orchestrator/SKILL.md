@@ -1,9 +1,9 @@
 ---
-name: workhorse-ai
+name: workhorse-ai-orchestrator
 description: Use when delegating substantive implementation work (feature, bugfix, refactor, tests) to another agent and accepting the result — the discipline of the workhorse delegation journal (draft → delegate → report → own verification → accept).
 ---
 
-# Workhorse AI — orchestration discipline
+# Workhorse AI — the orchestrator's discipline
 
 ## Overview
 

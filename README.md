@@ -3,6 +3,8 @@
 [![npm](https://img.shields.io/npm/v/workhorse-ai-mcp)](https://www.npmjs.com/package/workhorse-ai-mcp)
 [![skills.sh](https://skills.sh/b/workhorse-ai/workhorse-ai-mcp)](https://skills.sh/workhorse-ai/workhorse-ai-mcp)
 
+**Your AI is the workhorse. You are the orchestrator.**
+
 A delegation journal for orchestrator/worker AI workflows: an append-only
 event log over SQLite (tasks, reports, artifacts, incidents, full-text
 search) exposed as an MCP server. Zero dependencies — only Node.js >= 22.5
@@ -107,16 +109,21 @@ Sync is one-way: the journal is pushed up, the cloud never rewrites it. The
 cursor request is sent with `Cache-Control: no-store`, so a caching proxy in
 front of an on-premise instance cannot serve a stale cursor.
 
-## Orchestration skill
+## Skills
 
-The package ships `skills/workhorse-ai/SKILL.md` (in Russian) — the delegation
-discipline the journal is built around: orchestrator/worker roles, the
-`REPORTED != ACCEPTED` invariant, the mandatory project bootstrap, and the
-working order from `search_precedents` to `accept`.
+The package ships three skills — pick the one that matches your setup:
 
-Copy it into your agent's skill directory (for Claude Code:
-`~/.claude/skills/workhorse-ai/SKILL.md`), or just hand the file to the agent
-as instructions.
+| Skill | Install it on | What it teaches |
+|---|---|---|
+| `workhorse-ai-orchestrator` | the agent that assigns and accepts work | the full discipline: bootstrap, drafting assignments, line-by-line review, acceptance by your own test run |
+| `workhorse-ai-worker` | the agent that executes delegated tasks | the three journal duties, the report format, and the prohibitions (never accept your own work) |
+| `workhorse-ai-all` | a single agent playing both roles | the solo discipline: the report and the acceptance stay separate acts with separate evidence |
+
+Install via the Claude Code plugin (all three come along), or pick one:
+
+```bash
+npx skills add workhorse-ai/workhorse-ai-mcp --skill workhorse-ai-orchestrator
+```
 
 ## License
 
