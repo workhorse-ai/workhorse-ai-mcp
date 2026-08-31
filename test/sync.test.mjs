@@ -16,8 +16,14 @@ import { DatabaseSync } from "node:sqlite";
 import {
 	BATCH_SIZE,
 	defaultJournalId,
+	DEFAULT_CLOUD_URL,
+	inboxUrlFromBase,
+	inboxUrlFromSyncUrl,
 	loadSyncConfig,
+	normalizeBaseUrl,
 	pushJournal,
+	resolveCloudUrl,
+	syncUrlFromBase,
 	writeSyncConfig,
 } from "../sync.mjs";
 
@@ -77,7 +83,7 @@ function countEvents(dbPath) {
 // ============ мок облака ============
 
 function startMockCloud(t, { token = TOKEN } = {}) {
-	const state = { cursors: new Map(), seen: new Map(), posts: 0, gets: 0, lastAuth: null };
+	const state = { cursors: new Map(), seen: new Map(), posts: 0, gets: 0, lastAuth: null, cursorPath: null, cursorHeaders: null, postPath: null };
 	const server = createServer((req, res) => {
 		const url = new URL(req.url, "http://127.0.0.1");
 		state.lastAuth = req.headers.authorization ?? null;
@@ -88,6 +94,8 @@ function startMockCloud(t, { token = TOKEN } = {}) {
 		if (state.lastAuth !== `Bearer ${token}`) return send(401, { error: "Invalid or revoked MCP token" });
 		if (req.method === "GET") {
 			state.gets += 1;
+			state.cursorPath = url.pathname;
+			state.cursorHeaders = req.headers;
 			const journalId = url.searchParams.get("journalId");
 			if (!journalId) return send(400, { error: "Missing journalId query parameter" });
 			return send(200, { lastSeq: state.cursors.get(journalId) ?? 0 });
@@ -97,6 +105,7 @@ function startMockCloud(t, { token = TOKEN } = {}) {
 			req.on("data", (c) => (body += c));
 			req.on("end", () => {
 				state.posts += 1;
+				state.postPath = url.pathname;
 				const { journalId, events } = JSON.parse(body);
 				if (!journalId || !Array.isArray(events) || events.length === 0)
 					return send(400, { error: "Invalid input" });
@@ -131,6 +140,7 @@ function startMockCloud(t, { token = TOKEN } = {}) {
 			t.after(() => new Promise((r) => server.close(r)));
 			resolve({
 				url: `http://127.0.0.1:${port}/api/mcp/journal-sync`,
+				baseUrl: `http://127.0.0.1:${port}`,
 				port,
 				state,
 				close: () => new Promise((r) => server.close(r)),
@@ -532,7 +542,7 @@ test("MCP connect: успех → sync.json написан рядом с баз�
 	});
 	assert.equal(r.text, `подключено: курсор 0, журнал my-journal, конфиг ${configPath}`);
 	assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
-		url: cloud.url,
+		url: cloud.baseUrl,
 		token: TOKEN,
 		journalId: "my-journal",
 	});
@@ -562,7 +572,8 @@ test("MCP connect: плохой токен → 401, конфиг НЕ запис
 
 	// недоступное облако — тоже без конфига, с понятной причиной
 	const r2 = await c.tool("connect", { url: await deadEndpoint(), token: TOKEN });
-	assert.match(r2.text, /^не подключено: облако недоступно/);
+	// Сообщение называет конкретный хост — при on-premise это половина диагностики.
+	assert.match(r2.text, /^не подключено: http:\/\/127\.0\.0\.1:\d+ недоступен \(/);
 	assert.equal(existsSync(configPath), false);
 });
 
@@ -589,4 +600,92 @@ test("авто-пуш: без конфига — тихий no-op (ни стро
 	// даём setImmediate-хвостам отработать
 	await new Promise((r) => setTimeout(r, 100));
 	assert.equal(c.getStderr(), "", "никакого шума без конфига");
+});
+
+// ============ Базовый URL инстанса (on-premise, 0.8.1) ============
+
+test("normalizeBaseUrl: голая база, префикс прокси, полный эндпоинт, слеши", () => {
+	assert.equal(normalizeBaseUrl("https://wh.acme.internal"), "https://wh.acme.internal");
+	assert.equal(normalizeBaseUrl("https://wh.acme.internal/"), "https://wh.acme.internal");
+	// On-premise за реверс-прокси: префикс пути обязан сохраниться.
+	assert.equal(
+		normalizeBaseUrl("https://tools.acme.com/workhorse/"),
+		"https://tools.acme.com/workhorse",
+	);
+	// Совместимость: конфиги до 0.8.1 хранили полный адрес эндпоинта.
+	assert.equal(
+		normalizeBaseUrl("https://wh.acme.internal/api/mcp/journal-sync"),
+		"https://wh.acme.internal",
+	);
+	assert.equal(
+		normalizeBaseUrl("https://tools.acme.com/workhorse/api/mcp/journal-sync"),
+		"https://tools.acme.com/workhorse",
+	);
+	// Внутренняя сеть: http и нестандартный порт — валидная база.
+	assert.equal(normalizeBaseUrl("http://10.0.0.5:3300"), "http://10.0.0.5:3300");
+});
+
+test("syncUrlFromBase / inboxUrlFromBase: пути выводятся, префикс не теряется", () => {
+	assert.equal(
+		syncUrlFromBase("https://tools.acme.com/workhorse"),
+		"https://tools.acme.com/workhorse/api/mcp/journal-sync",
+	);
+	assert.equal(
+		inboxUrlFromBase("https://tools.acme.com/workhorse"),
+		"https://tools.acme.com/workhorse/api/mcp/journal-inbox",
+	);
+	// Старое имя принимает полный эндпоинт и отдаёт соседний.
+	assert.equal(
+		inboxUrlFromSyncUrl("https://wh.acme.internal/api/mcp/journal-sync"),
+		"https://wh.acme.internal/api/mcp/journal-inbox",
+	);
+});
+
+test("pushJournal: работает от базы и просит не кешировать курсор", async (t) => {
+	const dir = tmpDir();
+	const dbPath = makeJournalDb(dir);
+	const cloud = await startMockCloud(t);
+
+	// Передаём БАЗУ — пути должен вывести сам пушер.
+	const r = await pushJournal({
+		dbPath,
+		config: { url: cloud.baseUrl, token: TOKEN, journalId: JOURNAL },
+	});
+
+	assert.deepEqual(r, { pushed: 10, lastSeq: 10 });
+	assert.equal(cloud.state.cursorPath, "/api/mcp/journal-sync", "GET курсора ушёл на выведенный путь");
+	assert.equal(cloud.state.postPath, "/api/mcp/journal-sync", "POST батча тоже");
+	// Кеширующий прокси перед on-premise вернул бы устаревший lastSeq —
+	// и пушер погнал бы уже отправленные события заново.
+	assert.equal(cloud.state.cursorHeaders["cache-control"], "no-store");
+});
+
+test("resolveCloudUrl: без url — управляемое облако, env перекрывает, явный url главнее", () => {
+	assert.equal(resolveCloudUrl({ env: {} }), DEFAULT_CLOUD_URL);
+	assert.equal(
+		resolveCloudUrl({ env: { WORKHORSE_CLOUD_URL: "https://staging.workhorse-ai.dev" } }),
+		"https://staging.workhorse-ai.dev",
+	);
+	// On-premise: явный адрес перебивает и дефолт, и env.
+	assert.equal(
+		resolveCloudUrl({ url: "https://wh.acme.internal", env: { WORKHORSE_CLOUD_URL: "https://x" } }),
+		"https://wh.acme.internal",
+	);
+});
+
+test("MCP connect: без url подключается к облаку по умолчанию", async (t) => {
+	const dir = tmpDir();
+	const dbPath = makeJournalDb(dir);
+	const configPath = join(dir, "sync.json");
+	const cloud = await startMockCloud(t);
+	// Подменяем адрес управляемого облака на мок: проверяется сам факт, что
+	// url не обязателен, без похода в сеть.
+	const c = startMcp(t, cleanEnv({ WORKHORSE_DB: dbPath, WORKHORSE_CLOUD_URL: cloud.baseUrl }));
+
+	const r = await c.tool("connect", { token: TOKEN, journal_id: "default-cloud" });
+
+	assert.equal(r.text, `подключено: курсор 0, журнал default-cloud, конфиг ${configPath}`);
+	assert.equal(cloud.state.cursorPath, "/api/mcp/journal-sync");
+	const cfg = JSON.parse(readFileSync(configPath, "utf8"));
+	assert.equal(cfg.url, cloud.baseUrl, "в конфиг записан фактический адрес, а не пустота");
 });

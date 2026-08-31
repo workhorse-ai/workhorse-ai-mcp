@@ -60,6 +60,39 @@ a normalized `<username>-<hostname>`. After that, every journal write is
 auto-pushed; `sync` forces a push, and `inbox`/`take` pull task intents
 from the cloud.
 
+## Connecting to a cloud
+
+`connect` needs only a token — the managed Workhorse AI cloud is the default:
+
+```
+connect { "token": "pln_..." }
+```
+
+### Self-hosted (on-premise)
+
+Pass the **base URL** of your instance; endpoint paths are derived by the server,
+so a reverse-proxy prefix works as-is:
+
+```
+connect { "url": "https://workhorse.acme.internal", "token": "pln_..." }
+connect { "url": "https://tools.acme.com/workhorse", "token": "pln_..." }
+```
+
+The resolved base is stored in `sync.json` next to the database. To point every
+run at your instance without passing a URL, set `WORKHORSE_CLOUD_URL`.
+
+If your instance uses a certificate from an internal CA, give Node the root
+certificate — otherwise the TLS handshake fails and `connect` refuses to write
+the config:
+
+```
+NODE_EXTRA_CA_CERTS=/etc/ssl/certs/acme-root.pem
+```
+
+Sync is one-way: the journal is pushed up, the cloud never rewrites it. The
+cursor request is sent with `Cache-Control: no-store`, so a caching proxy in
+front of an on-premise instance cannot serve a stale cursor.
+
 ## Orchestration skill
 
 The package ships `skills/workhorse-ai/SKILL.md` (in Russian) — the delegation

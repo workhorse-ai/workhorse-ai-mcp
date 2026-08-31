@@ -1,6 +1,6 @@
 {
   "name": "workhorse-ai-mcp",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "private": false,
   "type": "module",
   "description": "Delegation journal for orchestrator/worker AI workflows: event sourcing over SQLite with an MCP interface. Zero dependencies.",

@@ -12,10 +12,13 @@ import { fileURLToPath } from "node:url";
 
 import {
 	defaultJournalId,
-	inboxUrlFromSyncUrl,
+	inboxUrlFromBase,
 	loadSyncConfig,
+	normalizeBaseUrl,
 	pushJournal,
+	resolveCloudUrl,
 	resolveDbPath,
+	syncUrlFromBase,
 	writeSyncConfig,
 } from "./sync.mjs";
 
@@ -538,7 +541,7 @@ const TOOLS = [
 	{
 		name: "connect",
 		description:
-			"Подключить журнал к облаку Workhorse AI: проверяет связь (GET курсора с токеном) и при успехе " +
+			"Подключить журнал к облаку Workhorse AI (или к своему on-premise через url): проверяет связь (GET курсора с токеном) и при успехе " +
 			"сам пишет sync.json рядом с базой — ручная настройка не нужна. journal_id по умолчанию " +
 			"собирается из имени пользователя и машины. Повторный connect перезаписывает конфиг " +
 			"(осознанная смена воркспейса/токена). При ошибке связи конфиг не трогается.",
@@ -547,7 +550,7 @@ const TOOLS = [
 			properties: {
 				url: {
 					type: "string",
-					description: "URL синка воркспейса, напр. https://<ваш-хост>/api/mcp/journal-sync",
+					description: "Базовый URL инстанса: не указан — управляемое облако Workhorse AI; свой on-premise — напр. https://wh.acme.internal (можно с префиксом прокси). Пути эндпоинтов сервер добавит сам",
 				},
 				token: { type: "string", description: "MCP-токен воркспейса (Bearer)" },
 				journal_id: {
@@ -555,16 +558,20 @@ const TOOLS = [
 					description: "Имя журнала (default: <username>-<hostname>, нормализованное)",
 				},
 			},
-			required: ["url", "token"],
+			required: ["token"],
 		},
 		handler: async ({ url, token, journal_id }) => {
 			const journalId = journal_id ?? defaultJournalId();
 			if (!/^[a-z0-9-]+$/.test(journalId)) {
 				return `не подключено: journal_id «${journalId}» — допустимы только строчные латинские буквы, цифры и дефисы`;
 			}
+			// На вход — базовый адрес инстанса; пути эндпоинтов знает сервер.
+			// Полный URL журнала-синка тоже принимаем: так писали до 0.8.1.
+			let baseUrl;
 			let cursorUrl;
 			try {
-				cursorUrl = new URL(url);
+				baseUrl = normalizeBaseUrl(resolveCloudUrl({ url }));
+				cursorUrl = new URL(syncUrlFromBase(baseUrl));
 			} catch {
 				return `не подключено: некорректный url «${url}»`;
 			}
@@ -572,10 +579,19 @@ const TOOLS = [
 			let res;
 			try {
 				res = await fetch(cursorUrl, {
-					headers: { authorization: `Bearer ${token}` },
+					headers: {
+						authorization: `Bearer ${token}`,
+						"cache-control": "no-store",
+						pragma: "no-cache",
+					},
 				});
 			} catch (err) {
-				return `не подключено: облако недоступно (${err.cause?.code ?? err.message})`;
+				const code = err.cause?.code ?? err.message;
+				// Частый случай on-premise: сертификат внутреннего CA.
+				const hint = /CERT|SELF_SIGNED|UNABLE_TO_VERIFY/i.test(String(code))
+					? " — похоже на самоподписанный сертификат; укажите корневой сертификат через NODE_EXTRA_CA_CERTS=/path/to/ca.pem"
+					: "";
+				return `не подключено: ${cursorUrl.origin} недоступен (${code})${hint}`;
 			}
 			if (!res.ok) {
 				const reason =
@@ -590,14 +606,14 @@ const TOOLS = [
 			try {
 				({ lastSeq } = await res.json());
 			} catch {
-				return "не подключено: облако ответило не-JSON (это точно URL journal-sync?). Конфиг не записан.";
+				return `не подключено: ${cursorUrl.origin} ответил не-JSON (это точно адрес инстанса Workhorse AI?). Конфиг не записан.`;
 			}
 			if (!Number.isInteger(lastSeq) || lastSeq < 0) {
 				return `не подключено: облако вернуло некорректный lastSeq (${lastSeq}). Конфиг не записан.`;
 			}
 			const configPath = writeSyncConfig({
 				dbPath: DB_PATH,
-				config: { url, token, journalId },
+				config: { url: baseUrl, token, journalId },
 			});
 			scheduleAutoPush();
 			return `подключено: курсор ${lastSeq}, журнал ${journalId}, конфиг ${configPath}`;
@@ -632,7 +648,7 @@ const TOOLS = [
 				return "инбокс не настроен: в конфиге синка нужны url и token";
 			}
 			try {
-				const res = await fetch(inboxUrlFromSyncUrl(config.url), {
+				const res = await fetch(inboxUrlFromBase(config.url), {
 					headers: { authorization: `Bearer ${config.token}` },
 				});
 				if (!res.ok) return `ошибка инбокса: HTTP ${res.status}`;
@@ -670,7 +686,7 @@ const TOOLS = [
 				return "инбокс не настроен: в конфиге синка нужны url и token";
 			}
 			try {
-				const res = await fetch(inboxUrlFromSyncUrl(config.url), {
+				const res = await fetch(inboxUrlFromBase(config.url), {
 					method: "POST",
 					headers: {
 						authorization: `Bearer ${config.token}`,
@@ -846,7 +862,7 @@ function handle(msg) {
 			respond(id, {
 				protocolVersion: params?.protocolVersion ?? "2024-11-05",
 				capabilities: { tools: {}, prompts: {} },
-				serverInfo: { name: "workhorse-mcp", version: "0.8.0" },
+				serverInfo: { name: "workhorse-mcp", version: "0.8.1" },
 				instructions: SERVER_INSTRUCTIONS,
 			});
 		} else if (method === "prompts/list") {

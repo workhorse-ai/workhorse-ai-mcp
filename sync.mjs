@@ -76,12 +76,48 @@ export function defaultJournalId({ username, host } = {}) {
 
 // URL инбокса намерений выводится из url синка заменой последнего сегмента
 // пути (journal-sync → journal-inbox): один конфиг — меньше настройки.
-export function inboxUrlFromSyncUrl(syncUrl) {
-	const url = new URL(syncUrl);
-	url.pathname = url.pathname
-		.replace(/\/+$/, "")
-		.replace(/[^/]*$/, "journal-inbox");
-	return url.toString();
+// Пути эндпоинтов — деталь реализации сервера, а не пользователя: в конфиге
+// живёт БАЗОВЫЙ адрес инстанса (облако или on-premise, в том числе за
+// реверс-прокси с префиксом), а конкретные пути выводятся здесь.
+// Управляемое облако Workhorse AI — адрес по умолчанию, когда url не задан.
+// Перекрывается WORKHORSE_CLOUD_URL (полезно для стейджинга и своих сборок).
+export const DEFAULT_CLOUD_URL = "https://app.workhorse-ai.dev";
+
+export function resolveCloudUrl({ url, env = process.env } = {}) {
+	return url ?? env.WORKHORSE_CLOUD_URL ?? DEFAULT_CLOUD_URL;
+}
+
+export const SYNC_PATH = "/api/mcp/journal-sync";
+export const INBOX_PATH = "/api/mcp/journal-inbox";
+
+// Принимает и базу («https://wh.acme.internal», «https://tools.acme.com/workhorse»),
+// и полный эндпоинт — последнее нужно для конфигов, написанных до 0.8.1.
+export function normalizeBaseUrl(input) {
+	const url = new URL(input);
+	let path = url.pathname.replace(/\/+$/, "");
+	for (const suffix of [SYNC_PATH, INBOX_PATH]) {
+		if (path.toLowerCase().endsWith(suffix)) {
+			path = path.slice(0, -suffix.length);
+			break;
+		}
+	}
+	url.pathname = path;
+	url.search = "";
+	url.hash = "";
+	return url.toString().replace(/\/+$/, "");
+}
+
+export function syncUrlFromBase(base) {
+	return `${normalizeBaseUrl(base)}${SYNC_PATH}`;
+}
+
+export function inboxUrlFromBase(base) {
+	return `${normalizeBaseUrl(base)}${INBOX_PATH}`;
+}
+
+// Совместимость со старым именем: принимает что угодно из двух форм.
+export function inboxUrlFromSyncUrl(input) {
+	return inboxUrlFromBase(input);
 }
 
 // Локальный payload хранится TEXT-JSON; облачная схема ждёт объект.
@@ -111,9 +147,12 @@ export async function pushJournal({ dbPath, config, log = () => {} }) {
 			"content-type": "application/json",
 		};
 
-		const cursorUrl = new URL(config.url);
+		// GET курсора обязан быть свежим: закешированный прокси-ответ вернул бы
+		// устаревший lastSeq, и мы погнали бы уже отправленные события заново.
+		const cursorHeaders = { ...headers, "cache-control": "no-store", pragma: "no-cache" };
+		const cursorUrl = new URL(syncUrlFromBase(config.url));
 		cursorUrl.searchParams.set("journalId", config.journalId);
-		const cursorRes = await fetch(cursorUrl, { headers });
+		const cursorRes = await fetch(cursorUrl, { headers: cursorHeaders });
 		if (!cursorRes.ok) {
 			return { error: `GET курсора: HTTP ${cursorRes.status}` };
 		}
@@ -146,7 +185,7 @@ export async function pushJournal({ dbPath, config, log = () => {} }) {
 				at: row.at,
 				payload: parsePayload(row.payload),
 			}));
-			const res = await fetch(config.url, {
+			const res = await fetch(syncUrlFromBase(config.url), {
 				method: "POST",
 				headers,
 				body: JSON.stringify({ journalId: config.journalId, events: batch }),
