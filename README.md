@@ -1,7 +1,8 @@
 # workhorse-ai-mcp
 
 [![npm](https://img.shields.io/npm/v/workhorse-ai-mcp)](https://www.npmjs.com/package/workhorse-ai-mcp)
-[![skills.sh](https://skills.sh/b/workhorse-ai/workhorse-ai-mcp)](https://skills.sh/workhorse-ai/workhorse-ai-mcp)
+[![skills.sh](https://img.shields.io/badge/skills.sh-3_skills-8A2BE2)](https://skills.sh/workhorse-ai/workhorse-ai-mcp)
+<!-- TODO: когда каталог проиндексирует установки, вернуть живой счётчик: https://skills.sh/b/workhorse-ai/workhorse-ai-mcp -->
 
 **Your AI is the workhorse. You are the orchestrator.**
 
