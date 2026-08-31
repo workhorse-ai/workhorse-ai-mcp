@@ -1,5 +1,8 @@
 # workhorse-ai-mcp
 
+[![npm](https://img.shields.io/npm/v/workhorse-ai-mcp)](https://www.npmjs.com/package/workhorse-ai-mcp)
+[![skills.sh](https://skills.sh/b/workhorse-ai/workhorse-ai-mcp)](https://skills.sh/workhorse-ai/workhorse-ai-mcp)
+
 A delegation journal for orchestrator/worker AI workflows: an append-only
 event log over SQLite (tasks, reports, artifacts, incidents, full-text
 search) exposed as an MCP server. Zero dependencies — only Node.js >= 22.5
