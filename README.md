@@ -98,6 +98,83 @@ connect { "url": "https://tools.acme.com/workhorse", "token": "pln_..." }
 The resolved base is stored in `sync.json` next to the database. To point every
 run at your instance without passing a URL, set `WORKHORSE_CLOUD_URL`.
 
+### Configure from `.mcp.json` instead
+
+If you would rather keep the credentials with the rest of your MCP config —
+no `connect` call, no `sync.json` — pass them as environment variables. They
+take precedence over the file:
+
+```json
+{
+  "mcpServers": {
+    "workhorse": {
+      "command": "npx",
+      "args": ["-y", "workhorse-ai-mcp"],
+      "env": {
+        "WORKHORSE_SYNC_URL": "https://app.workhorse-ai.dev",
+        "WORKHORSE_SYNC_TOKEN": "pln_..."
+      }
+    }
+  }
+}
+```
+
+`WORKHORSE_SYNC_URL` takes the same **base URL** as `connect`. The journal id
+defaults to `<user>-<host>`; override it with `WORKHORSE_SYNC_JOURNAL_ID` when
+one machine feeds several journals.
+
+### Several workspaces at once
+
+One machine, one journal — but projects may belong to different teams. List the
+targets in `sync.json` and the journal is pushed to every one of them, each with
+its own cursor and its own scope:
+
+```json
+{
+  "targets": [
+    { "alias": "acme", "url": "https://wh.acme.internal", "token": "pln_...", "journalId": "kv-mac" },
+    { "alias": "lab",  "url": "https://app.workhorse-ai.dev", "token": "pln_...", "journalId": "kv-mac" }
+  ]
+}
+```
+
+`connect { "alias": "lab", "token": "pln_..." }` adds a target instead of
+replacing the config. On a flat config without an `alias` it overwrites, exactly
+as before; once a `targets` list exists it replaces only its own entry — matched
+by alias, or by url plus journal id — and leaves the neighbours alone. The
+flat single-target form (`{url, token, journalId}`) keeps working untouched, and
+so do the `WORKHORSE_SYNC_*` variables — they describe one target, so when a
+`targets` list is present they are ignored with a line on stderr rather than
+silently adding a third destination.
+
+A target that is down does not hold up the others: the push reports per target,
+and a failing one is a line on stderr, never a crash.
+
+### Which projects are pushed (sync scope)
+
+The journal is one per machine and holds every project you work on, while a
+cloud workspace belongs to a team. Bind the projects that may go there:
+
+```
+sync_scope {}                            # what would be pushed, and why
+sync_scope { "projects": ["acme-web"] }   # bind these to the connected workspace
+```
+
+`sync_scope` asks the cloud for the workspace id itself and records it as
+`cloud_workspace_id` in the project registry — no manual ids, no SQLite editing.
+With several targets, `sync_scope {}` reports each of them and binding names the
+target by its alias: `sync_scope { "target": "acme", "projects": ["acme-web"] }`.
+`WORKHORSE_SYNC_PROJECTS="acme-web,acme-api"` overrides the registry for one
+process. With no mapping anywhere the push stays as before — everything goes —
+and warns about it on every run.
+
+While a scope is active, events that belong to no project (journal-level
+incidents, `_general`) and `ProjectRegistered` stay local. Widening the scope
+re-pushes from seq 0 so previously filtered events catch up; the cloud drops
+duplicates by seq. The last scope is remembered per target in `sync-state.json`
+next to the database (keyed by workspace id), so widening the scope of one target
+does not re-push everything to the others.
+
 If your instance uses a certificate from an internal CA, give Node the root
 certificate — otherwise the TLS handshake fails and `connect` refuses to write
 the config:

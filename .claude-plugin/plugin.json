@@ -1,11 +1,11 @@
 {
-  "name": "workhorse-ai",
-  "version": "0.9.0",
-  "description": "Your AI is the workhorse, you are the orchestrator. A delegation journal (MCP over SQLite, event sourcing) plus three discipline skills: orchestrator, worker, and solo. Key invariant: REPORTED (the worker believes it is done) ≠ ACCEPTED (verified by the orchestrator's own test run).",
-  "author": {
-    "name": "Aleksey Nikitin",
-    "email": "kvandake@gmail.com"
-  },
-  "homepage": "https://github.com/workhorse-ai/workhorse-ai-mcp",
-  "license": "MIT"
+	"name": "workhorse-ai",
+	"version": "0.9.0",
+	"description": "Your AI is the workhorse, you are the orchestrator. A delegation journal (MCP over SQLite, event sourcing) plus three discipline skills: orchestrator, worker, and solo. Key invariant: REPORTED (the worker believes it is done) ≠ ACCEPTED (verified by the orchestrator's own test run).",
+	"author": {
+		"name": "Aleksey Nikitin",
+		"email": "kvandake@gmail.com"
+	},
+	"homepage": "https://github.com/workhorse-ai/workhorse-ai-mcp",
+	"license": "MIT"
 }

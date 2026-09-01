@@ -42,7 +42,7 @@ Tool inventory (names may be prefixed by your client, e.g. `mcp__workhorse__*`):
 | Task lifecycle | `draft_task`, `delegate`, `submit_report`, `accept`, `request_rework`, `mark_failed` |
 | Knowledge | `search_precedents`, `record_artifact`, `record_incident`, `list_artifacts` |
 | Overview | `get_task`, `list_tasks`, `link_tasks` |
-| Cloud (optional) | `connect`, `sync`, `inbox`, `take` |
+| Cloud (optional) | `connect`, `sync_scope`, `sync`, `inbox`, `take` |
 
 ## Roles
 
@@ -184,6 +184,11 @@ the discipline.
 
 - **`connect`** — checks the connection and writes the sync config next to the
   database. After that every journal write is pushed upstream fire-and-forget.
+- **`sync_scope`** — which projects may reach that workspace. The journal is one
+  per machine and holds every project you work on, so without a scope another
+  team's workspace receives your other clients' tasks. Run `sync_scope {}` right
+  after connecting to see what would be pushed, and bind the projects that belong
+  there.
 - **`sync`** — a forced push (strictly one direction: the journal goes up, the cloud
   never rewrites the journal).
 - **`inbox`** / **`take`** — task intents arrive from the cloud: `inbox` shows the

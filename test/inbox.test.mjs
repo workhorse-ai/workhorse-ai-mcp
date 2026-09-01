@@ -30,7 +30,13 @@ function tmpDir() {
 // env без унаследованных WORKHORSE_SYNC_* (чтобы окружение машины не влияло)
 function cleanEnv(extra = {}) {
 	const env = { ...process.env };
-	for (const k of ["WORKHORSE_SYNC_URL", "WORKHORSE_SYNC_TOKEN", "WORKHORSE_SYNC_JOURNAL_ID", "WORKHORSE_SYNC_CONFIG", "WORKHORSE_DB"])
+	for (const k of [
+		"WORKHORSE_SYNC_URL",
+		"WORKHORSE_SYNC_TOKEN",
+		"WORKHORSE_SYNC_JOURNAL_ID",
+		"WORKHORSE_SYNC_CONFIG",
+		"WORKHORSE_DB",
+	])
 		delete env[k];
 	return { ...env, ...extra };
 }
@@ -151,8 +157,9 @@ function startMcp(t, env) {
 	child.stdout.setEncoding("utf8");
 	child.stdout.on("data", (chunk) => {
 		buf += chunk;
-		let nl;
-		while ((nl = buf.indexOf("\n")) !== -1) {
+		while (true) {
+			const nl = buf.indexOf("\n");
+			if (nl === -1) break;
 			const line = buf.slice(0, nl).trim();
 			buf = buf.slice(nl + 1);
 			if (!line) continue;
@@ -167,7 +174,7 @@ function startMcp(t, env) {
 		new Promise((resolve) => {
 			const id = ++seq;
 			pending.set(id, resolve);
-			child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+			child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
 		});
 	const tool = async (name, args) => {
 		const msg = await call("tools/call", { name, arguments: args });
@@ -278,7 +285,10 @@ test("take: болванка для draft_task — intent_task_id, контек�
 test("draft_task: intent_task_id уезжает в payload события TaskDrafted (сырое событие)", async (t) => {
 	const dir = tmpDir();
 	// Без конфига синка: авто-пуш — тихий no-op, журнал живёт локально
-	const c = startMcp(t, cleanEnv({ WORKHORSE_DB: join(dir, "local.db"), WORKHORSE_SCHEMA: SCHEMA }));
+	const c = startMcp(
+		t,
+		cleanEnv({ WORKHORSE_DB: join(dir, "local.db"), WORKHORSE_SCHEMA: SCHEMA }),
+	);
 	await c.tool("register_project", { name: "demo", root_path: "/tmp/demo" });
 
 	let r = await c.tool("draft_task", {
@@ -290,7 +300,9 @@ test("draft_task: intent_task_id уезжает в payload события TaskDr
 	});
 	assert.equal(r.ok, true);
 
-	r = await c.tool("get_task", { task_id: `demo/${new Date().toISOString().slice(0, 10)}-with-intent` });
+	r = await c.tool("get_task", {
+		task_id: `demo/${new Date().toISOString().slice(0, 10)}-with-intent`,
+	});
 	assert.equal(r.ok, true);
 	const drafted = r.data.events.find((e) => e.type === "TaskDrafted");
 	assert.equal(JSON.parse(drafted.payload).intent_task_id, "intent-42");
@@ -312,7 +324,10 @@ test("draft_task: intent_task_id уезжает в payload события TaskDr
 
 test("inbox/take: без конфига синка — «инбокс не настроен», сервер жив", async (t) => {
 	const dir = tmpDir();
-	const c = startMcp(t, cleanEnv({ WORKHORSE_DB: join(dir, "plain.db"), WORKHORSE_SCHEMA: SCHEMA }));
+	const c = startMcp(
+		t,
+		cleanEnv({ WORKHORSE_DB: join(dir, "plain.db"), WORKHORSE_SCHEMA: SCHEMA }),
+	);
 
 	let r = await c.tool("inbox", {});
 	assert.equal(r.text, "инбокс не настроен (нет sync.json)");

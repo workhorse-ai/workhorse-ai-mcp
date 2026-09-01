@@ -12,19 +12,29 @@ import { fileURLToPath } from "node:url";
 
 import {
 	defaultJournalId,
+	fetchCursor,
 	inboxUrlFromBase,
 	loadSyncConfig,
+	loadSyncTargets,
 	normalizeBaseUrl,
 	pushJournal,
+	readSyncConfigFile,
 	resolveCloudUrl,
 	resolveDbPath,
+	resolveSyncScope,
 	syncUrlFromBase,
+	targetAlias,
 	writeSyncConfig,
 } from "./sync.mjs";
 
+const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url));
+
+// Версия — единственный источник правды package.json: продублированная в коде
+// строка неминуемо разъезжается с опубликованной.
+const PACKAGE_VERSION = JSON.parse(readFileSync(join(PACKAGE_DIR, "package.json"), "utf8")).version;
+
 const DB_PATH = resolveDbPath();
-const SCHEMA_PATH =
-	process.env.WORKHORSE_SCHEMA ?? join(dirname(fileURLToPath(import.meta.url)), "schema.sql");
+const SCHEMA_PATH = process.env.WORKHORSE_SCHEMA ?? join(PACKAGE_DIR, "schema.sql");
 
 // Чистый старт на пустой машине: директория данных создаётся сама,
 // иначе node:sqlite падает CANTOPEN ещё до применения схемы.
@@ -52,9 +62,7 @@ const VALID_FROM = {
 };
 
 const getTaskStmt = db.prepare("SELECT * FROM tasks WHERE task_id = ?");
-const insertEventStmt = db.prepare(
-	"INSERT INTO events(task_id, type, payload) VALUES (?, ?, ?)",
-);
+const insertEventStmt = db.prepare("INSERT INTO events(task_id, type, payload) VALUES (?, ?, ?)");
 
 // Авто-пуш синка: fire-and-forget после успешной записи события. НИКОГДА не
 // блокирует и не роняет запись: нет конфига — молчаливый no-op, ошибка/офлайн —
@@ -69,11 +77,14 @@ function scheduleAutoPush() {
 	syncInFlight = true;
 	setImmediate(async () => {
 		try {
-			const config = loadSyncConfig({ dbPath: DB_PATH });
-			if (config) {
-				const result = await pushJournal({ dbPath: DB_PATH, config });
-				if (result.error) {
-					console.error(`workhorse-mcp: авто-пуш синка не прошёл: ${result.error}`);
+			const targets = loadSyncTargets({ dbPath: DB_PATH });
+			if (targets.length > 0) {
+				// Цели независимы: ошибка одной — строка в stderr, остальные едут.
+				const result = await pushJournal({ dbPath: DB_PATH, targets });
+				for (const target of result.targets) {
+					if (!target.error) continue;
+					const where = targets.length > 1 ? ` (${target.alias})` : "";
+					console.error(`workhorse-mcp: авто-пуш синка не прошёл${where}: ${target.error}`);
 				}
 			}
 		} catch (err) {
@@ -226,12 +237,19 @@ const TOOLS = [
 		inputSchema: {
 			type: "object",
 			properties: {
-				name: { type: "string", description: "Короткое имя (латиница/цифры/дефисы), напр. dom-pro" },
+				name: {
+					type: "string",
+					description: "Короткое имя (латиница/цифры/дефисы), напр. dom-pro",
+				},
 				root_path: { type: "string", description: "Абсолютный путь к корню проекта" },
-				cloud_workspace_id: { type: "string", description: "Id пространства в облаке (опционально)" },
+				cloud_workspace_id: {
+					type: "string",
+					description: "Id пространства в облаке (опционально)",
+				},
 				force: {
 					type: "boolean",
-					description: "Осознанно зарегистрировать несмотря на похожий проект (guard от почти-дублей)",
+					description:
+						"Осознанно зарегистрировать несмотря на похожий проект (guard от почти-дублей)",
 				},
 			},
 			required: ["name", "root_path"],
@@ -245,9 +263,7 @@ const TOOLS = [
 			if (!force) {
 				const conflicts = findProjectConflicts(name, root_path);
 				if (conflicts.length > 0) {
-					const listing = conflicts
-						.map((p) => `"${p.name}" (${p.root_path})`)
-						.join(", ");
+					const listing = conflicts.map((p) => `"${p.name}" (${p.root_path})`).join(", ");
 					throw new Error(
 						`Похоже, проект уже зарегистрирован: ${listing}. ` +
 							"Используй существующее имя (resolve_project найдёт проект по пути), " +
@@ -271,14 +287,20 @@ const TOOLS = [
 		inputSchema: {
 			type: "object",
 			properties: {
-				path: { type: "string", description: "Абсолютный путь (папка проекта или файла внутри него)" },
+				path: {
+					type: "string",
+					description: "Абсолютный путь (папка проекта или файла внутри него)",
+				},
 				name: { type: "string", description: "Предполагаемое имя проекта" },
 			},
 		},
 		handler: ({ path, name }) => {
 			const all = db.prepare("SELECT name, root_path, cloud_workspace_id, at FROM projects").all();
 			const byPath = path
-				? all.filter((p) => withSlash(path).startsWith(withSlash(p.root_path)) || pathsOverlap(p.root_path, path))
+				? all.filter(
+						(p) =>
+							withSlash(path).startsWith(withSlash(p.root_path)) || pathsOverlap(p.root_path, path),
+					)
 				: [];
 			const norm = name ? normalizeProjectName(name) : null;
 			const byName = norm
@@ -299,7 +321,9 @@ const TOOLS = [
 		description: "Реестр проектов: имя, путь на диске, маппинг на пространство в облаке.",
 		inputSchema: { type: "object", properties: {} },
 		handler: () =>
-			db.prepare("SELECT name, root_path, cloud_workspace_id, at FROM projects ORDER BY name").all(),
+			db
+				.prepare("SELECT name, root_path, cloud_workspace_id, at FROM projects ORDER BY name")
+				.all(),
 	},
 	{
 		name: "draft_task",
@@ -496,7 +520,9 @@ const TOOLS = [
 			requireProject(project);
 			appendEvent(task_id, "ArtifactRecorded", JSON.stringify({ project, kind, title, body }));
 			return db
-				.prepare("SELECT id, task_id, project, kind, title, at FROM artifacts ORDER BY id DESC LIMIT 1")
+				.prepare(
+					"SELECT id, task_id, project, kind, title, at FROM artifacts ORDER BY id DESC LIMIT 1",
+				)
 				.get();
 		},
 	},
@@ -516,7 +542,8 @@ const TOOLS = [
 	},
 	{
 		name: "list_artifacts",
-		description: "Список артефактов с фильтрами по проекту/типу/задаче (без тела — только заголовки).",
+		description:
+			"Список артефактов с фильтрами по проекту/типу/задаче (без тела — только заголовки).",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -529,12 +556,23 @@ const TOOLS = [
 		handler: ({ project, kind, task_id, limit = 20 }) => {
 			const cond = [];
 			const args = [];
-			if (project) { cond.push("project = ?"); args.push(project); }
-			if (kind) { cond.push("kind = ?"); args.push(kind); }
-			if (task_id) { cond.push("task_id = ?"); args.push(task_id); }
+			if (project) {
+				cond.push("project = ?");
+				args.push(project);
+			}
+			if (kind) {
+				cond.push("kind = ?");
+				args.push(kind);
+			}
+			if (task_id) {
+				cond.push("task_id = ?");
+				args.push(task_id);
+			}
 			const where = cond.length ? `WHERE ${cond.join(" AND ")}` : "";
 			return db
-				.prepare(`SELECT id, task_id, project, kind, title, at FROM artifacts ${where} ORDER BY id DESC LIMIT ?`)
+				.prepare(
+					`SELECT id, task_id, project, kind, title, at FROM artifacts ${where} ORDER BY id DESC LIMIT ?`,
+				)
 				.all(...args, limit);
 		},
 	},
@@ -544,23 +582,32 @@ const TOOLS = [
 			"Подключить журнал к облаку Workhorse AI (или к своему on-premise через url): проверяет связь (GET курсора с токеном) и при успехе " +
 			"сам пишет sync.json рядом с базой — ручная настройка не нужна. journal_id по умолчанию " +
 			"собирается из имени пользователя и машины. Повторный connect перезаписывает конфиг " +
-			"(осознанная смена воркспейса/токена). При ошибке связи конфиг не трогается.",
+			"(осознанная смена воркспейса/токена); чтобы ДОБАВИТЬ вторую цель, а не заменить " +
+			"текущую, передай alias — журнал будет пушиться во все цели сразу. " +
+			"При ошибке связи конфиг не трогается.",
 		inputSchema: {
 			type: "object",
 			properties: {
 				url: {
 					type: "string",
-					description: "Базовый URL инстанса: не указан — управляемое облако Workhorse AI; свой on-premise — напр. https://wh.acme.internal (можно с префиксом прокси). Пути эндпоинтов сервер добавит сам",
+					description:
+						"Базовый URL инстанса: не указан — управляемое облако Workhorse AI; свой on-premise — напр. https://wh.acme.internal (можно с префиксом прокси). Пути эндпоинтов сервер добавит сам",
 				},
 				token: { type: "string", description: "MCP-токен воркспейса (Bearer)" },
 				journal_id: {
 					type: "string",
 					description: "Имя журнала (default: <username>-<hostname>, нормализованное)",
 				},
+				alias: {
+					type: "string",
+					description:
+						"Имя цели в конфиге. Задан — цель добавляется к уже настроенным (журнал " +
+						"поедет во все); не задан — конфиг перезаписывается как раньше",
+				},
 			},
 			required: ["token"],
 		},
-		handler: async ({ url, token, journal_id }) => {
+		handler: async ({ url, token, journal_id, alias }) => {
 			const journalId = journal_id ?? defaultJournalId();
 			if (!/^[a-z0-9-]+$/.test(journalId)) {
 				return `не подключено: journal_id «${journalId}» — допустимы только строчные латинские буквы, цифры и дефисы`;
@@ -603,20 +650,215 @@ const TOOLS = [
 				return `не подключено: HTTP ${res.status} — ${reason}. Конфиг не записан.`;
 			}
 			let lastSeq;
+			let workspaceId = null;
 			try {
-				({ lastSeq } = await res.json());
+				({ lastSeq, workspaceId = null } = await res.json());
 			} catch {
 				return `не подключено: ${cursorUrl.origin} ответил не-JSON (это точно адрес инстанса Workhorse AI?). Конфиг не записан.`;
 			}
 			if (!Number.isInteger(lastSeq) || lastSeq < 0) {
 				return `не подключено: облако вернуло некорректный lastSeq (${lastSeq}). Конфиг не записан.`;
 			}
-			const configPath = writeSyncConfig({
-				dbPath: DB_PATH,
-				config: { url: baseUrl, token, journalId },
-			});
+			// Конфиг: одна цель — плоский вид (как до многоцелевого синка), несколько —
+			// {targets: [...]}. Цель с тем же alias (или тем же url+журналом)
+			// заменяется, остальные остаются на месте.
+			const existing = readSyncConfigFile({ dbPath: DB_PATH });
+			const existingTargets = Array.isArray(existing?.targets)
+				? existing.targets.filter((t) => t && typeof t === "object" && !Array.isArray(t))
+				: existing?.url || existing?.token || existing?.journalId
+					? [existing]
+					: [];
+			const fresh = { ...(alias ? { alias } : {}), url: baseUrl, token, journalId };
+			let config;
+			if (alias || existingTargets.length > 1 || Array.isArray(existing?.targets)) {
+				const sameTarget = (t, index) =>
+					alias
+						? targetAlias(t, index) === alias
+						: t.url === baseUrl && (t.journalId ?? journalId) === journalId;
+				const kept = existingTargets.filter((t, index) => !sameTarget(t, index));
+				config = { targets: [...kept, fresh] };
+			} else {
+				config = { url: baseUrl, token, journalId };
+			}
+			const configPath = writeSyncConfig({ dbPath: DB_PATH, config });
 			scheduleAutoPush();
-			return `подключено: курсор ${lastSeq}, журнал ${journalId}, конфиг ${configPath}`;
+			let connected = `подключено: курсор ${lastSeq}, журнал ${journalId}, конфиг ${configPath}`;
+			if (config.targets) {
+				// Целей стало несколько — человек должен видеть, куда теперь едет журнал.
+				const aliases = config.targets.map((t, index) => targetAlias(t, index)).join(", ");
+				connected += `\nцелей синка: ${config.targets.length} (${aliases}) — журнал поедет во все`;
+			}
+			// Журнал один на машину: если проектов несколько, а область не задана,
+			// в это пространство уедут они все — сказать об этом надо здесь, а не
+			// после того, как чужие задачи уже уехали.
+			const registry = db.prepare("SELECT name, cloud_workspace_id FROM projects").all();
+			const scope = resolveSyncScope({
+				projects: registry,
+				workspaceId: typeof workspaceId === "string" ? workspaceId : null,
+			});
+			if (!scope.projects && registry.length > 1) {
+				return (
+					`${connected}\nвнимание: область синка не задана — в это пространство уедут ВСЕ ` +
+					`проекты журнала (${registry.map((p) => p.name).join(", ")}). ` +
+					"Ограничить: sync_scope { projects: [...] }."
+				);
+			}
+			return connected;
+		},
+	},
+	{
+		name: "sync_scope",
+		description:
+			"Область синка: какие проекты журнала уезжают в подключённые пространства. " +
+			"Без аргументов — показать область по каждой цели синка и как она выведена. " +
+			"С projects — привязать перечисленные проекты к пространству одной цели " +
+			"(id пространства спрашивается у облака, руками его знать не нужно; цель " +
+			"называется алиасом из sync.json — по умолчанию хост её адреса). " +
+			"Локальный журнал один на машину и хранит все проекты сразу — без области в " +
+			"чужое пространство уедут чужие задачи.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				projects: {
+					type: "array",
+					items: { type: "string" },
+					description:
+						"Имена зарегистрированных проектов, которые синкаются в это пространство. " +
+						"Пустой массив снимает привязку со всех (снова уедет всё).",
+				},
+				target: {
+					type: "string",
+					description:
+						"Цель синка, к которой привязываются проекты: алиас из sync.json или её url. " +
+						"Не нужен, если цель одна.",
+				},
+			},
+		},
+		handler: async ({ projects, target }) => {
+			const targets = loadSyncTargets({ dbPath: DB_PATH });
+			if (targets.length === 0) return "синк не настроен (нет sync.json) — сначала connect";
+
+			// id пространства локально знать неоткуда — спрашиваем каждое облако.
+			const entries = [];
+			for (const t of targets) {
+				entries.push({ target: t, cursor: await fetchCursor({ config: t }) });
+			}
+
+			const describe = (entry) => {
+				const registry = db.prepare("SELECT name, cloud_workspace_id FROM projects").all();
+				const scope = resolveSyncScope({
+					projects: registry,
+					workspaceId: entry.cursor.workspaceId,
+				});
+				const source =
+					scope.source === "env"
+						? "WORKHORSE_SYNC_PROJECTS"
+						: scope.source === "mapping"
+							? "маппинг cloud_workspace_id"
+							: "область не задана";
+				return { scope, source };
+			};
+
+			if (Array.isArray(projects)) {
+				// Привязка всегда к ОДНОЙ цели: проект уезжает в конкретное пространство.
+				let chosen;
+				if (typeof target === "string" && target.trim()) {
+					const needle = target.trim().toLowerCase();
+					chosen = entries.find(
+						(e) =>
+							e.target.alias.toLowerCase() === needle ||
+							(e.target.url ?? "").toLowerCase() === needle,
+					);
+					if (!chosen) {
+						throw new Error(
+							`Цель «${target}» не найдена. Доступные: ${entries.map((e) => e.target.alias).join(", ")}`,
+						);
+					}
+				} else if (entries.length === 1) {
+					chosen = entries[0];
+				} else {
+					throw new Error(
+						`Целей синка несколько — укажи target: ${entries.map((e) => e.target.alias).join(", ")}`,
+					);
+				}
+
+				if (chosen.cursor.error) {
+					return `не удалось спросить облако (${chosen.target.alias}): ${chosen.cursor.error}`;
+				}
+				if (!chosen.cursor.workspaceId) {
+					return (
+						"облако не сообщило id пространства (старая версия сервера?) — " +
+						"привязать проекты нечем; ограничить область можно переменной " +
+						"WORKHORSE_SYNC_PROJECTS"
+					);
+				}
+				const known = db.prepare("SELECT name, root_path, cloud_workspace_id FROM projects").all();
+				const byName = new Map(known.map((p) => [p.name, p]));
+				const missing = projects.filter((name) => !byName.has(name));
+				if (missing.length > 0) {
+					throw new Error(
+						`Не зарегистрированы: ${missing.join(", ")} (list_projects покажет реестр)`,
+					);
+				}
+				// Маппинг живёт в проекции projects, а она наполняется событиями:
+				// меняем его перерегистрацией, а не правкой таблицы.
+				// Снятие привязки — пустая строка, а не null: триггер схемы делает
+				// coalesce(excluded, старое), то есть null трактует как «не трогать»
+				// (так register_project без cloud_workspace_id не стирает маппинг).
+				// Чужие пространства не трогаем: снимаем только привязку к текущему —
+				// именно поэтому вторая цель не теряет свои проекты.
+				const wanted = new Set(projects);
+				for (const project of known) {
+					const targetWorkspace = wanted.has(project.name)
+						? chosen.cursor.workspaceId
+						: project.cloud_workspace_id === chosen.cursor.workspaceId
+							? ""
+							: project.cloud_workspace_id;
+					if ((targetWorkspace ?? null) === (project.cloud_workspace_id ?? null)) continue;
+					appendEvent(
+						"_general",
+						"ProjectRegistered",
+						JSON.stringify({
+							name: project.name,
+							root_path: project.root_path,
+							cloud_workspace_id: targetWorkspace,
+						}),
+					);
+				}
+			}
+
+			// Одна цель — отчёт ровно такой, каким был до многоцелевого синка.
+			if (entries.length === 1) {
+				const [entry] = entries;
+				if (entry.cursor.error) return `не удалось спросить облако: ${entry.cursor.error}`;
+				const { scope, source } = describe(entry);
+				if (!scope.projects) {
+					return `область синка: ВСЕ проекты (${source}). ${scope.warning ?? ""}`.trim();
+				}
+				const names = [...scope.projects].join(", ") || "(пусто — не уедет ничего)";
+				return (
+					`область синка: ${names} (источник: ${source}, пространство ${entry.cursor.workspaceId ?? "?"}).\n` +
+					"Общие события (task_id = _general) и ProjectRegistered при активной области не отправляются."
+				);
+			}
+
+			const lines = entries.map((entry) => {
+				if (entry.cursor.error) {
+					return `- ${entry.target.alias} (${entry.target.url}): облако недоступно — ${entry.cursor.error}`;
+				}
+				const { scope, source } = describe(entry);
+				const where = `пространство ${entry.cursor.workspaceId ?? "?"}`;
+				if (!scope.projects) {
+					return `- ${entry.target.alias} (${entry.target.url}): ВСЕ проекты (${source}, ${where})`;
+				}
+				const names = [...scope.projects].join(", ") || "(пусто — не уедет ничего)";
+				return `- ${entry.target.alias} (${entry.target.url}): ${names} (источник: ${source}, ${where})`;
+			});
+			return (
+				`область синка по целям (${entries.length}):\n${lines.join("\n")}\n` +
+				"Привязать проекты к одной из них: sync_scope { target: <алиас>, projects: [...] }.\n" +
+				"Общие события (task_id = _general) и ProjectRegistered при активной области не отправляются."
+			);
 		},
 	},
 	{
@@ -627,11 +869,26 @@ const TOOLS = [
 			"либо env WORKHORSE_SYNC_URL/TOKEN/JOURNAL_ID. Без конфига синк выключен.",
 		inputSchema: { type: "object", properties: {} },
 		handler: async () => {
-			const config = loadSyncConfig({ dbPath: DB_PATH });
-			if (!config) return "синк не настроен (нет sync.json)";
-			const result = await pushJournal({ dbPath: DB_PATH, config });
-			if (result.error) return `ошибка синка: ${result.error}`;
-			return `отправлено ${result.pushed} событий, курсор ${result.lastSeq}`;
+			const targets = loadSyncTargets({ dbPath: DB_PATH });
+			if (targets.length === 0) return "синк не настроен (нет sync.json)";
+			const result = await pushJournal({ dbPath: DB_PATH, targets });
+			if (targets.length === 1) {
+				const [only] = result.targets;
+				if (only.error) return `ошибка синка: ${only.error}`;
+				return `отправлено ${only.pushed} событий, курсор ${only.lastSeq}`;
+			}
+			// Несколько целей: сводка по каждой — упавшая цель не должна прятаться
+			// за успехом соседней.
+			const lines = result.targets.map((t) =>
+				t.error
+					? `- ${t.alias}: ошибка синка — ${t.error}`
+					: `- ${t.alias}: отправлено ${t.pushed} событий, курсор ${t.lastSeq}`,
+			);
+			const failed = result.targets.filter((t) => t.error).length;
+			const head = failed
+				? `целей ${result.targets.length}, из них с ошибкой ${failed}:`
+				: `целей ${result.targets.length}, все успешно:`;
+			return `${head}\n${lines.join("\n")}`;
 		},
 	},
 	{
@@ -639,7 +896,8 @@ const TOOLS = [
 		description:
 			"Инбокс намерений из облака (pull: облако только отдаёт список, забирает оркестратор). " +
 			"Показывает предложенные Task-намерения с контекстом фичи. Конфиг — тот же, что у синка " +
-			"(sync.json / env), URL инбокса выводится из url синка. Забрать намерение — инструмент take.",
+			"(sync.json / env), URL инбокса выводится из url синка. При нескольких целях синка " +
+			"инбокс читается у первой. Забрать намерение — инструмент take.",
 		inputSchema: { type: "object", properties: {} },
 		handler: async () => {
 			const config = loadSyncConfig({ dbPath: DB_PATH });
@@ -657,8 +915,7 @@ const TOOLS = [
 					return "инбокс пуст: 0 намерений";
 				}
 				const lines = items.map(
-					(item) =>
-						`- ${item.id} — ${item.title} (фича: ${item.feature?.title ?? "?"})`,
+					(item) => `- ${item.id} — ${item.title} (фича: ${item.feature?.title ?? "?"})`,
 				);
 				return `${items.length} намерений:\n${lines.join("\n")}\n\nЗабрать: take { task_id: <id> }.`;
 			} catch (err) {
@@ -767,8 +1024,14 @@ const TOOLS = [
 		handler: ({ status, project, limit = 20 }) => {
 			const cond = [];
 			const args = [];
-			if (status) { cond.push("status = ?"); args.push(status); }
-			if (project) { cond.push("project = ?"); args.push(project); }
+			if (status) {
+				cond.push("status = ?");
+				args.push(status);
+			}
+			if (project) {
+				cond.push("project = ?");
+				args.push(project);
+			}
 			const where = cond.length ? `WHERE ${cond.join(" AND ")}` : "";
 			return db
 				.prepare(
@@ -804,7 +1067,9 @@ const PROMPTS = [
 				required: false,
 			},
 		],
-		build: ({ filter = "" }) => `Покажи журнал делегирования workhorse (инструменты mcp__workhorse__*).
+		build: ({
+			filter = "",
+		}) => `Покажи журнал делегирования workhorse (инструменты mcp__workhorse__*).
 
 Фильтр: "${filter}"
 
@@ -823,7 +1088,9 @@ const PROMPTS = [
 				required: false,
 			},
 		],
-		build: ({ project = "" }) => `Собери основу (baseline) проекта для журнала делегирования workhorse.
+		build: ({
+			project = "",
+		}) => `Собери основу (baseline) проекта для журнала делегирования workhorse.
 
 Проект: "${project}" (если пусто — определи по текущему каталогу / git remote).
 
@@ -845,14 +1112,12 @@ const PROMPTS = [
 
 function respond(id, result) {
 	if (id === undefined || id === null) return;
-	process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
+	process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
 }
 
 function respondError(id, message, code = -32000) {
 	if (id === undefined || id === null) return;
-	process.stdout.write(
-		JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }) + "\n",
-	);
+	process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } })}\n`);
 }
 
 function handle(msg) {
@@ -862,7 +1127,7 @@ function handle(msg) {
 			respond(id, {
 				protocolVersion: params?.protocolVersion ?? "2024-11-05",
 				capabilities: { tools: {}, prompts: {} },
-				serverInfo: { name: "workhorse-mcp", version: "0.9.0" },
+				serverInfo: { name: "workhorse-mcp", version: PACKAGE_VERSION },
 				instructions: SERVER_INSTRUCTIONS,
 			});
 		} else if (method === "prompts/list") {
@@ -932,8 +1197,9 @@ let buffer = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
 	buffer += chunk;
-	let nl;
-	while ((nl = buffer.indexOf("\n")) !== -1) {
+	while (true) {
+		const nl = buffer.indexOf("\n");
+		if (nl === -1) break;
 		const line = buffer.slice(0, nl).trim();
 		buffer = buffer.slice(nl + 1);
 		if (!line) continue;

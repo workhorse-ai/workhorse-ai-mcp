@@ -28,8 +28,9 @@ function startClient(t, dbPathOverride) {
 	child.stdout.setEncoding("utf8");
 	child.stdout.on("data", (chunk) => {
 		buf += chunk;
-		let nl;
-		while ((nl = buf.indexOf("\n")) !== -1) {
+		while (true) {
+			const nl = buf.indexOf("\n");
+			if (nl === -1) break;
 			const line = buf.slice(0, nl).trim();
 			buf = buf.slice(nl + 1);
 			if (!line) continue;
@@ -44,16 +45,14 @@ function startClient(t, dbPathOverride) {
 		new Promise((resolve) => {
 			const id = ++seq;
 			pending.set(id, resolve);
-			child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+			child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
 		});
 
 	// tools/call → {ok:true, data} либо {ok:false, error}
 	const tool = async (name, args) => {
 		const msg = await call("tools/call", { name, arguments: args });
 		const text = msg.result.content[0].text;
-		return msg.result.isError
-			? { ok: false, error: text }
-			: { ok: true, data: JSON.parse(text) };
+		return msg.result.isError ? { ok: false, error: text } : { ok: true, data: JSON.parse(text) };
 	};
 
 	return { call, tool, dbPath };
@@ -81,16 +80,39 @@ test("handshake: initialize, tools, prompts, instructions", async (t) => {
 	assert.deepEqual(Object.keys(init.capabilities).sort(), ["prompts", "tools"]);
 
 	const tools = (await c.call("tools/list")).result.tools.map((x) => x.name);
-	assert.equal(tools.length, 21);
-	for (const name of ["search_precedents", "draft_task", "delegate", "submit_report", "accept", "record_artifact", "link_tasks", "register_project", "connect", "sync", "inbox", "take"])
+	assert.equal(tools.length, 22);
+	for (const name of [
+		"search_precedents",
+		"draft_task",
+		"delegate",
+		"submit_report",
+		"accept",
+		"record_artifact",
+		"link_tasks",
+		"register_project",
+		"connect",
+		"sync",
+		"sync_scope",
+		"inbox",
+		"take",
+	])
 		assert.ok(tools.includes(name), name);
 
 	const prompts = (await c.call("prompts/list")).result.prompts;
-	assert.deepEqual(prompts.map((p) => p.name), ["tasks", "bootstrap"]);
-	const got = (await c.call("prompts/get", { name: "tasks", arguments: { filter: "dom-pro" } })).result;
+	assert.deepEqual(
+		prompts.map((p) => p.name),
+		["tasks", "bootstrap"],
+	);
+	const got = (await c.call("prompts/get", { name: "tasks", arguments: { filter: "dom-pro" } }))
+		.result;
 	assert.ok(got.messages[0].content.text.includes('"dom-pro"'), "фильтр подставлен в промпт");
-	const boot = (await c.call("prompts/get", { name: "bootstrap", arguments: { project: "dom-pro" } })).result;
-	assert.ok(boot.messages[0].content.text.includes("Project baseline:"), "bootstrap ведёт к артефакту baseline");
+	const boot = (
+		await c.call("prompts/get", { name: "bootstrap", arguments: { project: "dom-pro" } })
+	).result;
+	assert.ok(
+		boot.messages[0].content.text.includes("Project baseline:"),
+		"bootstrap ведёт к артефакту baseline",
+	);
 });
 
 test("чистый старт: WORKHORSE_DB в несуществующей вложенной директории", async (t) => {
@@ -113,7 +135,10 @@ test("жизненный цикл: draft → delegate → report → accept", as
 	const id = "test/lifecycle";
 
 	let r = await c.tool("draft_task", {
-		task_id: id, project: "test", title: "Цикл", task_text: "сделать дело, база 385/385",
+		task_id: id,
+		project: "test",
+		title: "Цикл",
+		task_text: "сделать дело, база 385/385",
 	});
 	assert.equal(r.data.status, "DRAFT");
 
@@ -197,10 +222,17 @@ test("draft_task: guards id и slug", async (t) => {
 	assert.match(r.error, /slug/);
 
 	r = await c.tool("draft_task", { project: "test", slug: "auto-id", title: "т", task_text: "x" });
-	assert.match(r.data.task_id, /^test\/\d{4}-\d{2}-\d{2}-auto-id$/, "id собран из project/даты/slug");
+	assert.match(
+		r.data.task_id,
+		/^test\/\d{4}-\d{2}-\d{2}-auto-id$/,
+		"id собран из project/даты/slug",
+	);
 
 	r = await c.tool("draft_task", {
-		task_id: "other-project/чужой-неймспейс", project: "demo-app", title: "т", task_text: "x",
+		task_id: "other-project/чужой-неймспейс",
+		project: "demo-app",
+		title: "т",
+		task_text: "x",
 	});
 	assert.equal(r.ok, false, "id из чужого неймспейса отбивается");
 	assert.match(r.error, /должен начинаться с "demo-app\/"/);
@@ -217,7 +249,9 @@ test("поиск прецедентов: FTS по задачам и отчёта
 	const c = startClient(t);
 	await bringToReported(c, "test/search-me"); // report: «падал -> прошёл»
 	await c.tool("draft_task", {
-		task_id: "test/other", project: "test", title: "иное",
+		task_id: "test/other",
+		project: "test",
+		title: "иное",
 		task_text: "перенормировать ранги ганта в расписании",
 	});
 	await c.tool("record_incident", {
@@ -226,10 +260,17 @@ test("поиск прецедентов: FTS по задачам и отчёта
 	});
 
 	let r = await c.tool("search_precedents", { query: "ранги ганта" });
-	assert.deepEqual(r.data.tasks.map((x) => x.task_id), ["test/other"], "поиск по тексту задания");
+	assert.deepEqual(
+		r.data.tasks.map((x) => x.task_id),
+		["test/other"],
+		"поиск по тексту задания",
+	);
 
 	r = await c.tool("search_precedents", { query: "прошёл" });
-	assert.ok(r.data.tasks.some((x) => x.task_id === "test/search-me"), "поиск по тексту отчёта");
+	assert.ok(
+		r.data.tasks.some((x) => x.task_id === "test/search-me"),
+		"поиск по тексту отчёта",
+	);
 
 	r = await c.tool("search_precedents", { query: "сборка гонка" });
 	assert.equal(r.data.incidents.length, 1);
@@ -237,7 +278,10 @@ test("поиск прецедентов: FTS по задачам и отчёта
 
 	// русская морфология через префиксный матч: запрос в другой форме, чем в тексте
 	r = await c.tool("search_precedents", { query: "ранг расписание" });
-	assert.ok(r.data.tasks.some((x) => x.task_id === "test/other"), "«ранг» находит «ранги», «расписание» — «расписании»");
+	assert.ok(
+		r.data.tasks.some((x) => x.task_id === "test/other"),
+		"«ранг» находит «ранги», «расписание» — «расписании»",
+	);
 });
 
 test("list_tasks: фильтры по статусу и проекту", async (t) => {
@@ -247,10 +291,16 @@ test("list_tasks: фильтры по статусу и проекту", async (
 	await c.tool("draft_task", { task_id: "beta/two", project: "beta", title: "т", task_text: "x" });
 
 	let r = await c.tool("list_tasks", { status: "REPORTED" });
-	assert.deepEqual(r.data.map((x) => x.task_id), ["alpha/one"]);
+	assert.deepEqual(
+		r.data.map((x) => x.task_id),
+		["alpha/one"],
+	);
 
 	r = await c.tool("list_tasks", { project: "beta" });
-	assert.deepEqual(r.data.map((x) => x.task_id), ["beta/two"]);
+	assert.deepEqual(
+		r.data.map((x) => x.task_id),
+		["beta/two"],
+	);
 
 	r = await c.tool("list_tasks", {});
 	assert.equal(r.data.length, 2);
@@ -261,27 +311,37 @@ test("артефакты: запись, версии, выборка, поиск
 
 	await reg(c, "workhorse");
 	let r = await c.tool("record_artifact", {
-		project: "workhorse", kind: "spec", title: "Формат журнала",
+		project: "workhorse",
+		kind: "spec",
+		title: "Формат журнала",
 		body: "event sourcing поверх sqlite, проекции триггерами",
 	});
 	assert.equal(r.data.kind, "spec");
 	const v1 = r.data.id;
 
 	r = await c.tool("record_artifact", {
-		project: "workhorse", kind: "spec", title: "Формат журнала",
+		project: "workhorse",
+		kind: "spec",
+		title: "Формат журнала",
 		body: "версия 2: добавлены артефакты и маппинг на облако",
 	});
 	assert.ok(r.data.id > v1, "повторная запись = новая версия, старая остаётся");
 
 	r = await c.tool("record_artifact", {
-		project: "test", kind: "bogus", title: "x", body: "y",
+		project: "test",
+		kind: "bogus",
+		title: "x",
+		body: "y",
 	});
 	assert.equal(r.ok, false, "неизвестный kind отбивается");
 
 	await bringToReported(c, "test/linked");
 	r = await c.tool("record_artifact", {
-		project: "test", kind: "decision", title: "Решение по задаче",
-		body: "принято в обсуждении", task_id: "test/linked",
+		project: "test",
+		kind: "decision",
+		title: "Решение по задаче",
+		body: "принято в обсуждении",
+		task_id: "test/linked",
 	});
 	assert.equal(r.data.task_id, "test/linked");
 
@@ -290,16 +350,25 @@ test("артефакты: запись, версии, выборка, поиск
 	assert.ok(!("body" in r.data[0]), "список без тел");
 
 	r = await c.tool("list_artifacts", { task_id: "test/linked" });
-	assert.deepEqual(r.data.map((a) => a.kind), ["decision"]);
+	assert.deepEqual(
+		r.data.map((a) => a.kind),
+		["decision"],
+	);
 
 	const full = await c.tool("get_artifact", { id: v1 });
 	assert.match(full.data.body, /event sourcing/);
 
 	r = await c.tool("search_precedents", { query: "маппинг облако" });
-	assert.ok(r.data.artifacts.some((a) => a.body_snippet.includes("[облако]")), "FTS по телу артефакта");
+	assert.ok(
+		r.data.artifacts.some((a) => a.body_snippet.includes("[облако]")),
+		"FTS по телу артефакта",
+	);
 
 	const hist = await c.tool("get_task", { task_id: "test/linked" });
-	assert.ok(hist.data.events.some((e) => e.type === "ArtifactRecorded"), "событие в истории задачи");
+	assert.ok(
+		hist.data.events.some((e) => e.type === "ArtifactRecorded"),
+		"событие в истории задачи",
+	);
 });
 
 test("связи задач: continues/discovered_from, guards", async (t) => {
@@ -309,10 +378,17 @@ test("связи задач: continues/discovered_from, guards", async (t) => {
 	await c.tool("accept", { task_id: oldId, verify_commit: "abc" });
 
 	const newId = "test/follow-up";
-	await c.tool("draft_task", { task_id: newId, project: "test", title: "Продолжение", task_text: "x" });
+	await c.tool("draft_task", {
+		task_id: newId,
+		project: "test",
+		title: "Продолжение",
+		task_text: "x",
+	});
 
 	let r = await c.tool("link_tasks", { from_task_id: newId, to_task_id: oldId, kind: "continues" });
-	assert.deepEqual(r.data, [{ from_task: newId, to_task: oldId, kind: "continues", at: r.data[0].at }]);
+	assert.deepEqual(r.data, [
+		{ from_task: newId, to_task: oldId, kind: "continues", at: r.data[0].at },
+	]);
 
 	r = await c.tool("link_tasks", { from_task_id: newId, to_task_id: oldId, kind: "bogus" });
 	assert.equal(r.ok, false, "неизвестный kind отбивается");
@@ -320,7 +396,11 @@ test("связи задач: continues/discovered_from, guards", async (t) => {
 	r = await c.tool("link_tasks", { from_task_id: newId, to_task_id: newId, kind: "relates" });
 	assert.equal(r.ok, false, "самоссылка отбивается");
 
-	r = await c.tool("link_tasks", { from_task_id: newId, to_task_id: "test/ghost", kind: "relates" });
+	r = await c.tool("link_tasks", {
+		from_task_id: newId,
+		to_task_id: "test/ghost",
+		kind: "relates",
+	});
 	assert.equal(r.ok, false, "линк на несуществующую задачу отбивается");
 
 	// повторный тот же линк — идемпотентно (UNIQUE + OR IGNORE)
@@ -351,7 +431,9 @@ test("реестр проектов: регистрация, guard, маппин
 	assert.equal(r.data.cloud_workspace_id, null);
 
 	r = await c.tool("register_project", {
-		name: "demo", root_path: "/tmp/demo-v2", cloud_workspace_id: "ws-123",
+		name: "demo",
+		root_path: "/tmp/demo-v2",
+		cloud_workspace_id: "ws-123",
 	});
 	assert.equal(r.data.root_path, "/tmp/demo-v2", "перерегистрация обновляет путь");
 	assert.equal(r.data.cloud_workspace_id, "ws-123");
@@ -363,7 +445,10 @@ test("реестр проектов: регистрация, guard, маппин
 	assert.equal(r.data.status, "DRAFT", "после регистрации задачи принимаются");
 
 	r = await c.tool("list_projects", {});
-	assert.deepEqual(r.data.map((p) => p.name), ["demo"]);
+	assert.deepEqual(
+		r.data.map((p) => p.name),
+		["demo"],
+	);
 });
 
 test("схема: guard-триггеры отбивают вставки мимо сервера", async (t) => {
@@ -373,21 +458,44 @@ test("схема: guard-триггеры отбивают вставки мим�
 	const db = new DatabaseSync(c.dbPath);
 	t.after(() => db.close());
 	const raw = (task, type, payload) =>
-		db.prepare("INSERT INTO events(task_id,type,payload) VALUES (?,?,?)").run(task, type, JSON.stringify(payload));
+		db
+			.prepare("INSERT INTO events(task_id,type,payload) VALUES (?,?,?)")
+			.run(task, type, JSON.stringify(payload));
 
-	assert.throws(() => raw("_general", "ArtifactRecorded", { project: "ghost", kind: "doc", title: "x", body: "y" }),
-		/not registered/, "артефакт в незарегистрированный проект");
-	assert.throws(() => raw("ghost/task", "TaskDrafted", { project: "ghost", title: "x", task_text: "y" }),
-		/not registered/, "задача в незарегистрированный проект");
+	assert.throws(
+		() =>
+			raw("_general", "ArtifactRecorded", { project: "ghost", kind: "doc", title: "x", body: "y" }),
+		/not registered/,
+		"артефакт в незарегистрированный проект",
+	);
+	assert.throws(
+		() => raw("ghost/task", "TaskDrafted", { project: "ghost", title: "x", task_text: "y" }),
+		/not registered/,
+		"задача в незарегистрированный проект",
+	);
 
 	// из REPORTED rework разрешён (guard молчит), а отчёт после него — уже нет
 	raw("test/db-guards", "ReworkRequested", { reason: "проверка" });
-	assert.throws(() => raw("test/db-guards", "ReportSubmitted", { report: "x" }),
-		/only from DELEGATED/, "отчёт из REWORK мимо делегации");
-	assert.throws(() => raw("test/db-guards", "TaskLinked", { to_task_id: "test/db-guards", kind: "relates" }),
-		/distinct existing/, "самоссылка на уровне БД");
-	assert.throws(() => db.prepare("INSERT INTO events(task_id,type,payload) VALUES ('_general','IncidentRecorded','не json')").run(),
-		/valid JSON/, "битый payload");
+	assert.throws(
+		() => raw("test/db-guards", "ReportSubmitted", { report: "x" }),
+		/only from DELEGATED/,
+		"отчёт из REWORK мимо делегации",
+	);
+	assert.throws(
+		() => raw("test/db-guards", "TaskLinked", { to_task_id: "test/db-guards", kind: "relates" }),
+		/distinct existing/,
+		"самоссылка на уровне БД",
+	);
+	assert.throws(
+		() =>
+			db
+				.prepare(
+					"INSERT INTO events(task_id,type,payload) VALUES ('_general','IncidentRecorded','не json')",
+				)
+				.run(),
+		/valid JSON/,
+		"битый payload",
+	);
 });
 
 test("схема: журнал событий append-only", async (t) => {
@@ -425,7 +533,11 @@ test("register_project: guard от почти-дублей и force", async (t) 
 	assert.equal(r.data.root_path, "/tmp/dom-pro-moved");
 
 	// force — осознанный обход
-	r = await c.tool("register_project", { name: "dompro", root_path: "/tmp/elsewhere", force: true });
+	r = await c.tool("register_project", {
+		name: "dompro",
+		root_path: "/tmp/elsewhere",
+		force: true,
+	});
 	assert.equal(r.ok, true);
 });
 
@@ -446,7 +558,10 @@ test("resolve_project: поиск по пути и похожему имени",
 
 	// подстрока имени
 	r = await c.tool("resolve_project", { name: "dom-pro-app-net" });
-	assert.equal(r.data.matches.some((m) => m.name === "dom-pro"), true);
+	assert.equal(
+		r.data.matches.some((m) => m.name === "dom-pro"),
+		true,
+	);
 
 	// ничего не найдено — пустой ответ
 	r = await c.tool("resolve_project", { path: "/nowhere", name: "zzz" });

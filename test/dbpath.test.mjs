@@ -45,7 +45,10 @@ test("resolveDbPath: дефолтный homedir берётся из систем
 				`import { resolveDbPath } from ${JSON.stringify(join(ROOT, "sync.mjs"))};
 				 process.stdout.write(resolveDbPath({ env: {} }));`,
 			],
-			{ env: { ...process.env, HOME: home, WORKHORSE_DB: "" }, stdio: ["ignore", "pipe", "inherit"] },
+			{
+				env: { ...process.env, HOME: home, WORKHORSE_DB: "" },
+				stdio: ["ignore", "pipe", "inherit"],
+			},
 		);
 		let buf = "";
 		child.stdout.setEncoding("utf8");
