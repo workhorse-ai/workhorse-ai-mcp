@@ -17,6 +17,7 @@ import {
 	loadSyncConfig,
 	loadSyncTargets,
 	normalizeBaseUrl,
+	parseWorkspaces,
 	pushJournal,
 	readSyncConfigFile,
 	resolveCloudUrl,
@@ -580,10 +581,11 @@ const TOOLS = [
 		name: "connect",
 		description:
 			"Подключить журнал к облаку Workhorse AI (или к своему on-premise через url): проверяет связь (GET курсора с токеном) и при успехе " +
-			"сам пишет sync.json рядом с базой — ручная настройка не нужна. journal_id по умолчанию " +
-			"собирается из имени пользователя и машины. Повторный connect перезаписывает конфиг " +
-			"(осознанная смена воркспейса/токена); чтобы ДОБАВИТЬ вторую цель, а не заменить " +
-			"текущую, передай alias — журнал будет пушиться во все цели сразу. " +
+			"сам пишет sync.json рядом с базой — ручная настройка не нужна. Токен личный: один токен " +
+			"покрывает все пространства пользователя, журнал раскладывается по ним согласно sync_scope. " +
+			"journal_id по умолчанию собирается из имени пользователя и машины. Повторный connect " +
+			"перезаписывает конфиг (осознанная смена облака/токена); чтобы ДОБАВИТЬ вторую цель, а не " +
+			"заменить текущую, передай alias — журнал будет пушиться во все цели сразу. " +
 			"При ошибке связи конфиг не трогается.",
 		inputSchema: {
 			type: "object",
@@ -593,7 +595,7 @@ const TOOLS = [
 					description:
 						"Базовый URL инстанса: не указан — управляемое облако Workhorse AI; свой on-premise — напр. https://wh.acme.internal (можно с префиксом прокси). Пути эндпоинтов сервер добавит сам",
 				},
-				token: { type: "string", description: "MCP-токен воркспейса (Bearer)" },
+				token: { type: "string", description: "Личный MCP-токен (Bearer)" },
 				journal_id: {
 					type: "string",
 					description: "Имя журнала (default: <username>-<hostname>, нормализованное)",
@@ -649,15 +651,14 @@ const TOOLS = [
 							: "облако отвергло запрос";
 				return `не подключено: HTTP ${res.status} — ${reason}. Конфиг не записан.`;
 			}
-			let lastSeq;
-			let workspaceId = null;
+			let workspaces;
 			try {
-				({ lastSeq, workspaceId = null } = await res.json());
+				workspaces = parseWorkspaces(await res.json());
 			} catch {
 				return `не подключено: ${cursorUrl.origin} ответил не-JSON (это точно адрес инстанса Workhorse AI?). Конфиг не записан.`;
 			}
-			if (!Number.isInteger(lastSeq) || lastSeq < 0) {
-				return `не подключено: облако вернуло некорректный lastSeq (${lastSeq}). Конфиг не записан.`;
+			if (!workspaces) {
+				return "не подключено: облако не вернуло workspaces (несовместимая версия сервера). Конфиг не записан.";
 			}
 			// Конфиг: одна цель — плоский вид (как до многоцелевого синка), несколько —
 			// {targets: [...]}. Цель с тем же alias (или тем же url+журналом)
@@ -682,26 +683,43 @@ const TOOLS = [
 			}
 			const configPath = writeSyncConfig({ dbPath: DB_PATH, config });
 			scheduleAutoPush();
-			let connected = `подключено: курсор ${lastSeq}, журнал ${journalId}, конфиг ${configPath}`;
+			// Токен личный: показать, какие пространства он открывает, — иначе
+			// человек не узнает, куда вообще может уехать журнал.
+			const spaces =
+				workspaces.length === 0
+					? "пространств у пользователя нет — журнал пока никуда не поедет"
+					: `пространства: ${workspaces.map((w) => `${w.slug} (курсор ${w.lastSeq})`).join(", ")}`;
+			let connected = `подключено: журнал ${journalId}, ${spaces}, конфиг ${configPath}`;
 			if (config.targets) {
 				// Целей стало несколько — человек должен видеть, куда теперь едет журнал.
 				const aliases = config.targets.map((t, index) => targetAlias(t, index)).join(", ");
 				connected += `\nцелей синка: ${config.targets.length} (${aliases}) — журнал поедет во все`;
 			}
-			// Журнал один на машину: если проектов несколько, а область не задана,
-			// в это пространство уедут они все — сказать об этом надо здесь, а не
-			// после того, как чужие задачи уже уехали.
+			// Журнал один на машину: сказать про область надо здесь, а не после
+			// того, как чужие задачи уже уехали (или молча не уехало ничего).
 			const registry = db.prepare("SELECT name, cloud_workspace_id FROM projects").all();
-			const scope = resolveSyncScope({
-				projects: registry,
-				workspaceId: typeof workspaceId === "string" ? workspaceId : null,
-			});
-			if (!scope.projects && registry.length > 1) {
-				return (
-					`${connected}\nвнимание: область синка не задана — в это пространство уедут ВСЕ ` +
-					`проекты журнала (${registry.map((p) => p.name).join(", ")}). ` +
-					"Ограничить: sync_scope { projects: [...] }."
-				);
+			if (workspaces.length === 1) {
+				const scope = resolveSyncScope({
+					projects: registry,
+					workspaceId: workspaces[0].id,
+					workspaceCount: 1,
+				});
+				if (!scope.projects && registry.length > 1) {
+					return (
+						`${connected}\nвнимание: область синка не задана — в пространство ${workspaces[0].slug} уедут ВСЕ ` +
+						`проекты журнала (${registry.map((p) => p.name).join(", ")}). ` +
+						"Ограничить: sync_scope { projects: [...] }."
+					);
+				}
+			} else if (workspaces.length > 1 && registry.length > 0) {
+				const mapped = registry.filter((p) => p.cloud_workspace_id);
+				if (mapped.length === 0) {
+					return (
+						`${connected}\nвнимание: пространств несколько, а область синка не задана — ` +
+						"журнал НИКУДА не поедет, пока проекты не привязаны: " +
+						"sync_scope { workspace: <slug>, projects: [...] }."
+					);
+				}
 			}
 			return connected;
 		},
@@ -709,13 +727,15 @@ const TOOLS = [
 	{
 		name: "sync_scope",
 		description:
-			"Область синка: какие проекты журнала уезжают в подключённые пространства. " +
-			"Без аргументов — показать область по каждой цели синка и как она выведена. " +
-			"С projects — привязать перечисленные проекты к пространству одной цели " +
-			"(id пространства спрашивается у облака, руками его знать не нужно; цель " +
-			"называется алиасом из sync.json — по умолчанию хост её адреса). " +
-			"Локальный журнал один на машину и хранит все проекты сразу — без области в " +
-			"чужое пространство уедут чужие задачи.",
+			"Область синка: какие проекты журнала в какое пространство уезжают. Токен личный, " +
+			"пространств у пользователя может быть несколько — привязка называет пространство " +
+			'его SLUG\'ом: sync_scope { workspace: "dom-pro", projects: [...] } (список ' +
+			"пространств спрашивается у облака, id руками знать не нужно). Пустой массив " +
+			"projects снимает привязку к этому пространству. Параметр target выбирает СЕРВЕР " +
+			"при нескольких целях синка (алиас из sync.json). Без аргументов — показать по " +
+			"каждому серверу пространства пользователя и какие проекты в какое уедут. " +
+			"Локальный журнал один на машину и хранит все проекты сразу — без области при " +
+			"нескольких пространствах журнал никуда не поедет.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -724,43 +744,60 @@ const TOOLS = [
 					items: { type: "string" },
 					description:
 						"Имена зарегистрированных проектов, которые синкаются в это пространство. " +
-						"Пустой массив снимает привязку со всех (снова уедет всё).",
+						"Пустой массив снимает привязку со всех проектов этого пространства.",
+				},
+				workspace: {
+					type: "string",
+					description:
+						"Slug пространства, к которому привязываются проекты (из списка облака). " +
+						"Не нужен, если пространство одно.",
 				},
 				target: {
 					type: "string",
 					description:
-						"Цель синка, к которой привязываются проекты: алиас из sync.json или её url. " +
-						"Не нужен, если цель одна.",
+						"Цель синка (СЕРВЕР): алиас из sync.json или её url. Не нужен, если цель одна.",
 				},
 			},
 		},
-		handler: async ({ projects, target }) => {
+		handler: async ({ projects, workspace, target }) => {
 			const targets = loadSyncTargets({ dbPath: DB_PATH });
 			if (targets.length === 0) return "синк не настроен (нет sync.json) — сначала connect";
 
-			// id пространства локально знать неоткуда — спрашиваем каждое облако.
+			// Список пространств локально знать неоткуда — спрашиваем каждое облако.
 			const entries = [];
 			for (const t of targets) {
 				entries.push({ target: t, cursor: await fetchCursor({ config: t }) });
 			}
 
+			// Отчёт по одному серверу: строка на каждое пространство пользователя.
 			const describe = (entry) => {
 				const registry = db.prepare("SELECT name, cloud_workspace_id FROM projects").all();
-				const scope = resolveSyncScope({
-					projects: registry,
-					workspaceId: entry.cursor.workspaceId,
+				const workspaces = entry.cursor.workspaces ?? [];
+				if (workspaces.length === 0) {
+					return ["пространств у пользователя нет — журналу некуда ехать"];
+				}
+				return workspaces.map((ws) => {
+					const scope = resolveSyncScope({
+						projects: registry,
+						workspaceId: ws.id,
+						workspaceCount: workspaces.length,
+					});
+					const source =
+						scope.source === "env"
+							? "WORKHORSE_SYNC_PROJECTS"
+							: scope.source === "mapping"
+								? "маппинг cloud_workspace_id"
+								: "область не задана";
+					if (!scope.projects) {
+						return `${ws.slug}: ВСЕ проекты (${source})`;
+					}
+					const names = [...scope.projects].join(", ") || "(пусто — не уедет ничего)";
+					return `${ws.slug}: ${names} (${source})`;
 				});
-				const source =
-					scope.source === "env"
-						? "WORKHORSE_SYNC_PROJECTS"
-						: scope.source === "mapping"
-							? "маппинг cloud_workspace_id"
-							: "область не задана";
-				return { scope, source };
 			};
 
 			if (Array.isArray(projects)) {
-				// Привязка всегда к ОДНОЙ цели: проект уезжает в конкретное пространство.
+				// Привязка всегда к ОДНОМУ пространству одного сервера.
 				let chosen;
 				if (typeof target === "string" && target.trim()) {
 					const needle = target.trim().toLowerCase();
@@ -785,13 +822,30 @@ const TOOLS = [
 				if (chosen.cursor.error) {
 					return `не удалось спросить облако (${chosen.target.alias}): ${chosen.cursor.error}`;
 				}
-				if (!chosen.cursor.workspaceId) {
-					return (
-						"облако не сообщило id пространства (старая версия сервера?) — " +
-						"привязать проекты нечем; ограничить область можно переменной " +
-						"WORKHORSE_SYNC_PROJECTS"
+				const workspaces = chosen.cursor.workspaces ?? [];
+				if (workspaces.length === 0) {
+					return "у пользователя нет пространств в этом облаке — привязывать не к чему";
+				}
+				// Пространство называется slug'ом — id человеку знать не нужно.
+				let chosenWs;
+				if (typeof workspace === "string" && workspace.trim()) {
+					const needle = workspace.trim().toLowerCase();
+					chosenWs = workspaces.find(
+						(ws) => ws.slug.toLowerCase() === needle || ws.id === workspace.trim(),
+					);
+					if (!chosenWs) {
+						throw new Error(
+							`Пространство «${workspace}» не найдено. Доступные: ${workspaces.map((ws) => ws.slug).join(", ")}`,
+						);
+					}
+				} else if (workspaces.length === 1) {
+					chosenWs = workspaces[0];
+				} else {
+					throw new Error(
+						`Пространств несколько — укажи workspace: ${workspaces.map((ws) => ws.slug).join(", ")}`,
 					);
 				}
+
 				const known = db.prepare("SELECT name, root_path, cloud_workspace_id FROM projects").all();
 				const byName = new Map(known.map((p) => [p.name, p]));
 				const missing = projects.filter((name) => !byName.has(name));
@@ -806,12 +860,12 @@ const TOOLS = [
 				// coalesce(excluded, старое), то есть null трактует как «не трогать»
 				// (так register_project без cloud_workspace_id не стирает маппинг).
 				// Чужие пространства не трогаем: снимаем только привязку к текущему —
-				// именно поэтому вторая цель не теряет свои проекты.
+				// именно поэтому соседнее пространство не теряет свои проекты.
 				const wanted = new Set(projects);
 				for (const project of known) {
 					const targetWorkspace = wanted.has(project.name)
-						? chosen.cursor.workspaceId
-						: project.cloud_workspace_id === chosen.cursor.workspaceId
+						? chosenWs.id
+						: project.cloud_workspace_id === chosenWs.id
 							? ""
 							: project.cloud_workspace_id;
 					if ((targetWorkspace ?? null) === (project.cloud_workspace_id ?? null)) continue;
@@ -827,38 +881,27 @@ const TOOLS = [
 				}
 			}
 
-			// Одна цель — отчёт ровно такой, каким был до многоцелевого синка.
+			const footer =
+				"Привязать проекты: sync_scope { workspace: <slug>, projects: [...] }" +
+				(entries.length > 1 ? " (+ target: <алиас> для выбора сервера)" : "") +
+				".\nОбщие события (task_id = _general) и ProjectRegistered при активной области не отправляются.";
+
+			// Один сервер — плоский отчёт по пространствам.
 			if (entries.length === 1) {
 				const [entry] = entries;
 				if (entry.cursor.error) return `не удалось спросить облако: ${entry.cursor.error}`;
-				const { scope, source } = describe(entry);
-				if (!scope.projects) {
-					return `область синка: ВСЕ проекты (${source}). ${scope.warning ?? ""}`.trim();
-				}
-				const names = [...scope.projects].join(", ") || "(пусто — не уедет ничего)";
-				return (
-					`область синка: ${names} (источник: ${source}, пространство ${entry.cursor.workspaceId ?? "?"}).\n` +
-					"Общие события (task_id = _general) и ProjectRegistered при активной области не отправляются."
-				);
+				const lines = describe(entry).map((line) => `- ${line}`);
+				return `область синка (пространства пользователя):\n${lines.join("\n")}\n${footer}`;
 			}
 
-			const lines = entries.map((entry) => {
+			const blocks = entries.map((entry) => {
 				if (entry.cursor.error) {
 					return `- ${entry.target.alias} (${entry.target.url}): облако недоступно — ${entry.cursor.error}`;
 				}
-				const { scope, source } = describe(entry);
-				const where = `пространство ${entry.cursor.workspaceId ?? "?"}`;
-				if (!scope.projects) {
-					return `- ${entry.target.alias} (${entry.target.url}): ВСЕ проекты (${source}, ${where})`;
-				}
-				const names = [...scope.projects].join(", ") || "(пусто — не уедет ничего)";
-				return `- ${entry.target.alias} (${entry.target.url}): ${names} (источник: ${source}, ${where})`;
+				const lines = describe(entry).map((line) => `    - ${line}`);
+				return `- ${entry.target.alias} (${entry.target.url}):\n${lines.join("\n")}`;
 			});
-			return (
-				`область синка по целям (${entries.length}):\n${lines.join("\n")}\n` +
-				"Привязать проекты к одной из них: sync_scope { target: <алиас>, projects: [...] }.\n" +
-				"Общие события (task_id = _general) и ProjectRegistered при активной области не отправляются."
-			);
+			return `область синка по целям (${entries.length}):\n${blocks.join("\n")}\n${footer}`;
 		},
 	},
 	{
@@ -875,7 +918,21 @@ const TOOLS = [
 			if (targets.length === 1) {
 				const [only] = result.targets;
 				if (only.error) return `ошибка синка: ${only.error}`;
-				return `отправлено ${only.pushed} событий, курсор ${only.lastSeq}`;
+				const workspaces = only.workspaces ?? [];
+				if (workspaces.length === 0) {
+					return "отправлено 0 событий: у пользователя нет пространств";
+				}
+				if (workspaces.length === 1) {
+					return `отправлено ${only.pushed} событий, курсор ${only.lastSeq}`;
+				}
+				// Несколько пространств: сводка по каждому — упавшее не должно
+				// прятаться за успехом соседнего.
+				const wsLines = workspaces.map((ws) =>
+					ws.error
+						? `- ${ws.slug}: ошибка — ${ws.error}`
+						: `- ${ws.slug}: отправлено ${ws.pushed} событий, курсор ${ws.lastSeq}`,
+				);
+				return `пространств ${workspaces.length}, отправлено ${only.pushed} событий:\n${wsLines.join("\n")}`;
 			}
 			// Несколько целей: сводка по каждой — упавшая цель не должна прятаться
 			// за успехом соседней.
@@ -895,9 +952,10 @@ const TOOLS = [
 		name: "inbox",
 		description:
 			"Инбокс намерений из облака (pull: облако только отдаёт список, забирает оркестратор). " +
-			"Показывает предложенные Task-намерения с контекстом фичи. Конфиг — тот же, что у синка " +
-			"(sync.json / env), URL инбокса выводится из url синка. При нескольких целях синка " +
-			"инбокс читается у первой. Забрать намерение — инструмент take.",
+			"Токен личный — намерения собираются из ВСЕХ пространств пользователя, у каждого видно " +
+			"пространство (slug). Конфиг — тот же, что у синка (sync.json / env), URL инбокса " +
+			"выводится из url синка. При нескольких целях синка инбокс читается у первой. " +
+			"Забрать намерение — инструмент take.",
 		inputSchema: { type: "object", properties: {} },
 		handler: async () => {
 			const config = loadSyncConfig({ dbPath: DB_PATH });
@@ -914,8 +972,12 @@ const TOOLS = [
 				if (!Array.isArray(items) || items.length === 0) {
 					return "инбокс пуст: 0 намерений";
 				}
+				// Токен личный — намерения приходят из всех пространств пользователя,
+				// пометка пространства обязательна: без неё непонятно, чьё это.
 				const lines = items.map(
-					(item) => `- ${item.id} — ${item.title} (фича: ${item.feature?.title ?? "?"})`,
+					(item) =>
+						`- ${item.id} — ${item.title} (фича: ${item.feature?.title ?? "?"}, ` +
+						`пространство: ${item.workspace?.slug ?? "?"})`,
 				);
 				return `${items.length} намерений:\n${lines.join("\n")}\n\nЗабрать: take { task_id: <id> }.`;
 			} catch (err) {
@@ -961,6 +1023,7 @@ const TOOLS = [
 						: `Намерение забрано из инбокса.`,
 					``,
 					`intent_task_id: ${context.id}`,
+					`Пространство: ${context.workspace?.slug ?? "?"}`,
 					``,
 					`## Контекст фичи: ${feature.title ?? "?"}`,
 					feature.description ?? "(описание фичи отсутствует)",

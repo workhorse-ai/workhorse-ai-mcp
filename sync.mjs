@@ -209,10 +209,13 @@ export function inboxUrlFromSyncUrl(input) {
 // пространство принадлежит команде. Слать всё подряд — утечка: второй участник
 // пространства увидит проекты, к которым не имеет отношения.
 //
-// Приоритет источников области:
-//   1. WORKHORSE_SYNC_PROJECTS — явное намерение человека, перекрывает всё;
-//   2. projects.cloud_workspace_id == пространство токена (его сообщает GET курсора);
-//   3. маппинга нет ни у одного проекта → шлём всё, как до 0.9 (+ предупреждение).
+// Токен личный: GET курсора отдаёт ВСЕ пространства пользователя, и область
+// вычисляется для каждого. Приоритет источников:
+//   1. WORKHORSE_SYNC_PROJECTS — только при единственном пространстве
+//      (env называет проекты, но не адресата);
+//   2. projects.cloud_workspace_id == id пространства (маппинг из sync_scope);
+//   3. маппинга нет ни у одного проекта: одно пространство → шлём всё туда
+//      (+ предупреждение), несколько → не шлём ничего и просим sync_scope.
 
 // Файл состояния синка рядом с базой: помнит область прошлого успешного пуша.
 // Это НЕ конфиг (тот может целиком жить в env) и НЕ журнал — журнал read-only.
@@ -323,35 +326,59 @@ export function eventProject({ taskId, type, payload }) {
 	return null;
 }
 
-// Область → {projects: Set|null, source, warning}. projects === null означает
-// «ограничения нет, шлём всё» (обратная совместимость).
-export function resolveSyncScope({ env = process.env, projects = [], workspaceId = null } = {}) {
+// Область ОДНОГО пространства → {projects: Set|null, source, warning}.
+// projects === null означает «ограничения нет, шлём всё»; пустой Set —
+// «в это пространство не уедет ничего».
+//
+// Токен личный, пространств у пользователя может быть несколько (workspaceCount):
+//   - WORKHORSE_SYNC_PROJECTS применяется только при ЕДИНСТВЕННОМ пространстве —
+//     env называет проекты, но не адресата, при нескольких пространствах он
+//     неоднозначен (предупреждение, дальше решает маппинг);
+//   - маппинга нет ни у одного проекта: одно пространство → шлём всё туда
+//     (+ предупреждение, как раньше); несколько → НИЧЕГО не шлём и просим
+//     sync_scope — приватность важнее удобства.
+export function resolveSyncScope({
+	env = process.env,
+	projects = [],
+	workspaceId = null,
+	workspaceCount = 1,
+} = {}) {
 	const fromEnv = parseSyncProjects(env.WORKHORSE_SYNC_PROJECTS);
-	if (fromEnv) {
+	if (fromEnv && workspaceCount === 1) {
 		return { projects: new Set(fromEnv), source: "env", warning: null };
 	}
+	const envWarning =
+		fromEnv && workspaceCount > 1
+			? "WORKHORSE_SYNC_PROJECTS игнорируется: пространств несколько, адресат " +
+				"неоднозначен — привяжите проекты инструментом sync_scope."
+			: null;
 
 	const mapped = projects.filter((p) => p?.cloud_workspace_id);
 	if (mapped.length === 0) {
+		if (workspaceCount === 1) {
+			return {
+				projects: null,
+				source: "all",
+				warning: [
+					envWarning,
+					"область синка не задана: ни у одного проекта нет cloud_workspace_id — " +
+						"в пространство уедут ВСЕ проекты журнала. Ограничить: инструмент sync_scope " +
+						"или переменная WORKHORSE_SYNC_PROJECTS.",
+				]
+					.filter(Boolean)
+					.join(" "),
+			};
+		}
 		return {
-			projects: null,
-			source: "all",
-			warning:
-				"область синка не задана: ни у одного проекта нет cloud_workspace_id — " +
-				"в облако уедут ВСЕ проекты журнала. Ограничить: инструмент sync_scope " +
-				"или переменная WORKHORSE_SYNC_PROJECTS.",
-		};
-	}
-
-	// Маппинг есть, но пространство неизвестно (облако старой версии не вернуло
-	// workspaceId) — сузить не по чему, поведение не меняем, но говорим об этом.
-	if (!workspaceId) {
-		return {
-			projects: null,
-			source: "all",
-			warning:
-				"маппинг проектов задан, но облако не сообщило id пространства " +
-				"(старая версия сервера?) — фильтрация невозможна, уедут все проекты.",
+			projects: new Set(),
+			source: "unmapped",
+			warning: [
+				envWarning,
+				"область синка не задана, а пространств несколько — журнал НИКУДА не уедет. " +
+					"Привязать проекты: sync_scope { workspace: <slug>, projects: [...] }.",
+			]
+				.filter(Boolean)
+				.join(" "),
 		};
 	}
 
@@ -360,7 +387,7 @@ export function resolveSyncScope({ env = process.env, projects = [], workspaceId
 			mapped.filter((p) => p.cloud_workspace_id === workspaceId).map((p) => p.name),
 		),
 		source: "mapping",
-		warning: null,
+		warning: envWarning,
 	};
 }
 
@@ -400,9 +427,30 @@ function parsePayload(text) {
 	}
 }
 
-// GET курсора: {lastSeq, workspaceId} либо {error}. Отдельно от pushJournal,
-// потому что id пространства нужен и инструменту sync_scope — локально его
-// знать неоткуда, единственный источник — ответ облака на токен.
+// Валидация списка пространств из ответа облака. Контракт GET:
+//   { workspaces: [{ id, slug, name, lastSeq }] }
+// — по элементу на каждое пространство пользователя (токен личный),
+// lastSeq — курсор пары (workspace, journal), 0 если курсора нет.
+export function parseWorkspaces(body) {
+	if (!Array.isArray(body?.workspaces)) return null;
+	const workspaces = [];
+	for (const ws of body.workspaces) {
+		if (typeof ws?.id !== "string" || !ws.id) return null;
+		if (!Number.isInteger(ws.lastSeq) || ws.lastSeq < 0) return null;
+		workspaces.push({
+			id: ws.id,
+			slug: typeof ws.slug === "string" ? ws.slug : ws.id,
+			name: typeof ws.name === "string" ? ws.name : "",
+			lastSeq: ws.lastSeq,
+		});
+	}
+	return workspaces;
+}
+
+// GET курсора: {workspaces: [{id, slug, name, lastSeq}]} либо {error}.
+// Отдельно от pushJournal, потому что список пространств нужен и инструменту
+// sync_scope — локально его знать неоткуда, единственный источник — ответ
+// облака на токен.
 export async function fetchCursor({ config }) {
 	if (!config?.url || !config?.token || !config?.journalId) {
 		return { error: "конфиг синка неполный: нужны url, token и journalId" };
@@ -419,10 +467,11 @@ export async function fetchCursor({ config }) {
 		});
 		if (!res.ok) return { error: `GET курсора: HTTP ${res.status}` };
 		const body = await res.json();
-		return {
-			lastSeq: body.lastSeq,
-			workspaceId: typeof body.workspaceId === "string" ? body.workspaceId : null,
-		};
+		const workspaces = parseWorkspaces(body);
+		if (!workspaces) {
+			return { error: "GET курсора: облако не вернуло workspaces (несовместимая версия сервера)" };
+		}
+		return { workspaces };
 	} catch (err) {
 		return { error: err instanceof Error ? err.message : String(err) };
 	}
@@ -447,9 +496,15 @@ function persistScope({ dbPath, env, projects, key, log }) {
 	}
 }
 
-// Пуш журнала в ОДНУ цель: {pushed, lastSeq} либо {error} — без исключений
-// наружу. Базу открывает read-only: пушер — транспорт, журнал он не меняет
-// никогда. Курсор, область и состояние области — свои у каждой цели.
+// Пуш журнала в ОДНУ цель (один сервер, один личный токен): облако отдаёт
+// список пространств пользователя, и журнал раскладывается по КАЖДОМУ из них
+// согласно маппингу cloud_workspace_id. Курсор, область и состояние области —
+// свои у каждой пары (пространство, журнал); пространства независимы: ошибка
+// одного не отменяет остальные.
+// Результат: {pushed: <сумма>, lastSeq: <максимум по пространствам>,
+//   workspaces: [{id, slug, pushed, lastSeq, error?}]} либо {error} — без
+// исключений наружу. Базу открывает read-only: пушер — транспорт, журнал он
+// не меняет никогда.
 export async function pushToTarget({ dbPath, target: config, env = process.env, log = () => {} }) {
 	if (!config) return { pushed: 0, disabled: true };
 	if (!config.url || !config.token || !config.journalId) {
@@ -464,7 +519,7 @@ export async function pushToTarget({ dbPath, target: config, env = process.env, 
 		};
 
 		// GET курсора обязан быть свежим: закешированный прокси-ответ вернул бы
-		// устаревший lastSeq, и мы погнали бы уже отправленные события заново.
+		// устаревшие lastSeq, и мы погнали бы уже отправленные события заново.
 		const cursorHeaders = { ...headers, "cache-control": "no-store", pragma: "no-cache" };
 		const cursorUrl = new URL(syncUrlFromBase(config.url));
 		cursorUrl.searchParams.set("journalId", config.journalId);
@@ -472,105 +527,144 @@ export async function pushToTarget({ dbPath, target: config, env = process.env, 
 		if (!cursorRes.ok) {
 			return { error: `GET курсора: HTTP ${cursorRes.status}` };
 		}
-		const { lastSeq, workspaceId } = await cursorRes.json();
-		if (!Number.isInteger(lastSeq) || lastSeq < 0) {
-			return { error: `GET курсора: облако вернуло некорректный lastSeq (${lastSeq})` };
+		const workspaces = parseWorkspaces(await cursorRes.json());
+		if (!workspaces) {
+			return { error: "GET курсора: облако не вернуло workspaces (несовместимая версия сервера)" };
+		}
+		if (workspaces.length === 0) {
+			log("workhorse-sync: у пользователя нет пространств — журнал слать некуда");
+			return { pushed: 0, lastSeq: 0, workspaces: [] };
 		}
 
-		// Ключ состояния области — по пространству цели: расширение области у
-		// одной цели не должно вызывать пересинк у остальных.
-		const stateKey = syncStateKey({
-			target: config,
-			workspaceId: typeof workspaceId === "string" ? workspaceId : null,
-		});
-
-		let rows;
+		// Журнал читаем один раз: реестр проектов (источник маппинга) и все
+		// события — дальше каждая пара (пространство, курсор) фильтрует своё.
 		let projects = [];
-		let scopeForState = null;
-		let cursorFrom = lastSeq;
+		let allEvents;
 		const db = new DatabaseSync(dbPath, { readOnly: true });
 		try {
-			// Реестр проектов — источник маппинга на пространство в облаке.
 			// Древняя база без таблицы projects не должна ронять пуш.
 			try {
 				projects = db.prepare("SELECT name, cloud_workspace_id FROM projects").all();
 			} catch {
 				projects = [];
 			}
-
-			const scope = resolveSyncScope({
-				env,
-				projects,
-				workspaceId: typeof workspaceId === "string" ? workspaceId : null,
-			});
-			if (scope.warning) log(`workhorse-sync: ${scope.warning}`);
-
-			// Курсор в облаке один на журнал и двигается до максимального
-			// применённого seq, поэтому отфильтрованные события остаются позади
-			// него. Расширили область — идём с нуля: приём батча идемпотентен по
-			// seq, облако отбросит уже виденное.
-			const previous = readSyncState({ dbPath, env, key: stateKey }).projects;
-			const rescan = needsRescan(previous, scope.projects);
-			const from = rescan ? 0 : lastSeq;
-			if (rescan) {
-				log(
-					"workhorse-sync: область синка расширилась — пересинхронизация с нуля " +
-						"(облако отбросит дубли по seq)",
-				);
-			}
-
-			const all = db
-				.prepare("SELECT seq, task_id, type, at, payload FROM events WHERE seq > ? ORDER BY seq")
-				.all(from);
-			rows = all
+			allEvents = db
+				.prepare("SELECT seq, task_id, type, at, payload FROM events ORDER BY seq")
+				.all()
 				.map((row) => ({
 					seq: row.seq,
 					taskId: row.task_id,
 					type: row.type,
 					at: row.at,
 					payload: parsePayload(row.payload),
-				}))
-				.filter((event) => shouldSyncEvent(event, scope.projects));
-
-			if (scope.projects) {
-				log(
-					`workhorse-sync: область — ${scope.source === "env" ? "WORKHORSE_SYNC_PROJECTS" : "маппинг"}: ` +
-						`${[...scope.projects].join(", ") || "(пусто)"}; отфильтровано ${all.length - rows.length} из ${all.length}`,
-				);
-			}
-			// Область текущего пуша — её запишем в состояние после успеха.
-			scopeForState = scope.projects ? [...scope.projects] : null;
-			cursorFrom = from;
+				}));
 		} finally {
 			db.close();
 		}
-		log(`workhorse-sync: событий за курсором ${cursorFrom}: ${rows.length}`);
-		if (rows.length === 0) {
-			persistScope({ dbPath, env, projects: scopeForState, key: stateKey, log });
-			return { pushed: 0, lastSeq, workspaceId: workspaceId ?? null };
+
+		const results = [];
+		// Одинаковые предупреждения (например «пространств несколько, области
+		// нет») не повторяются на каждое пространство.
+		const seenWarnings = new Set();
+		for (const ws of workspaces) {
+			// Лог помечаем пространством только при нескольких — с одним
+			// пространством строки остаются такими же, какими были всегда.
+			const wsLog = workspaces.length > 1 ? (line) => log(`{${ws.slug}} ${line}`) : log;
+
+			const scope = resolveSyncScope({
+				env,
+				projects,
+				workspaceId: ws.id,
+				workspaceCount: workspaces.length,
+			});
+			if (scope.warning && !seenWarnings.has(scope.warning)) {
+				seenWarnings.add(scope.warning);
+				log(`workhorse-sync: ${scope.warning}`);
+			}
+
+			// Ключ состояния области — id пространства: расширение области у
+			// одного пространства не должно вызывать пересинк у остальных.
+			const stateKey = syncStateKey({ target: config, workspaceId: ws.id });
+
+			// Курсор в облаке — на пару (пространство, журнал) и двигается до
+			// максимального применённого seq, поэтому отфильтрованные события
+			// остаются позади него. Расширили область — идём с нуля: приём батча
+			// идемпотентен по seq, облако отбросит уже виденное.
+			const previous = readSyncState({ dbPath, env, key: stateKey }).projects;
+			const rescan = needsRescan(previous, scope.projects);
+			const from = rescan ? 0 : ws.lastSeq;
+			if (rescan) {
+				wsLog(
+					"workhorse-sync: область синка расширилась — пересинхронизация с нуля " +
+						"(облако отбросит дубли по seq)",
+				);
+			}
+
+			const beyond = allEvents.filter((event) => event.seq > from);
+			const rows = beyond.filter((event) => shouldSyncEvent(event, scope.projects));
+			if (scope.projects) {
+				wsLog(
+					`workhorse-sync: область — ${scope.source === "env" ? "WORKHORSE_SYNC_PROJECTS" : "маппинг"}: ` +
+						`${[...scope.projects].join(", ") || "(пусто)"}; отфильтровано ${beyond.length - rows.length} из ${beyond.length}`,
+				);
+			}
+			// Область текущего пуша — её запишем в состояние после успеха.
+			const scopeForState = scope.projects ? [...scope.projects] : null;
+			wsLog(`workhorse-sync: событий за курсором ${from}: ${rows.length}`);
+
+			if (rows.length === 0) {
+				persistScope({ dbPath, env, projects: scopeForState, key: stateKey, log: wsLog });
+				results.push({ id: ws.id, slug: ws.slug, pushed: 0, lastSeq: ws.lastSeq });
+				continue;
+			}
+
+			let cursor = ws.lastSeq;
+			let pushed = 0;
+			let wsError = null;
+			for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+				const batch = rows.slice(i, i + BATCH_SIZE);
+				const res = await fetch(syncUrlFromBase(config.url), {
+					method: "POST",
+					headers,
+					body: JSON.stringify({
+						workspaceId: ws.id,
+						journalId: config.journalId,
+						events: batch,
+					}),
+				});
+				if (!res.ok) {
+					wsError = `POST батча: HTTP ${res.status}`;
+					break;
+				}
+				const result = await res.json();
+				cursor = result.lastSeq ?? batch[batch.length - 1].seq;
+				pushed += batch.length;
+				wsLog(`workhorse-sync: батч ${batch.length}, курсор облака ${cursor}`);
+			}
+			if (wsError) {
+				wsLog(`workhorse-sync: пространство не синхронизировано: ${wsError}`);
+				results.push({ id: ws.id, slug: ws.slug, pushed, lastSeq: cursor, error: wsError });
+				continue;
+			}
+			// Состояние пишем только после полного успеха: оборвался пуш — область
+			// не зафиксирована, следующий заход при необходимости повторит пересинк.
+			persistScope({ dbPath, env, projects: scopeForState, key: stateKey, log: wsLog });
+			results.push({ id: ws.id, slug: ws.slug, pushed, lastSeq: cursor });
 		}
 
-		let cursor = lastSeq;
-		let pushed = 0;
-		for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-			const batch = rows.slice(i, i + BATCH_SIZE);
-			const res = await fetch(syncUrlFromBase(config.url), {
-				method: "POST",
-				headers,
-				body: JSON.stringify({ journalId: config.journalId, events: batch }),
-			});
-			if (!res.ok) {
-				return { error: `POST батча: HTTP ${res.status}`, pushed, lastSeq: cursor };
-			}
-			const result = await res.json();
-			cursor = result.lastSeq ?? batch[batch.length - 1].seq;
-			pushed += batch.length;
-			log(`workhorse-sync: батч ${batch.length}, курсор облака ${cursor}`);
+		const failed = results.filter((r) => r.error);
+		const summary = {
+			pushed: results.reduce((sum, r) => sum + r.pushed, 0),
+			lastSeq: results.reduce((max, r) => Math.max(max, r.lastSeq ?? 0), 0),
+			workspaces: results,
+		};
+		if (failed.length === results.length && results.length > 0) {
+			summary.error =
+				results.length === 1
+					? failed[0].error
+					: failed.map((r) => `${r.slug}: ${r.error}`).join("; ");
 		}
-		// Состояние пишем только после полного успеха: оборвался пуш — область
-		// не зафиксирована, следующий заход при необходимости повторит пересинк.
-		persistScope({ dbPath, env, projects: scopeForState, key: stateKey, log });
-		return { pushed, lastSeq: cursor, workspaceId: workspaceId ?? null };
+		return summary;
 	} catch (err) {
 		return { error: err instanceof Error ? err.message : String(err) };
 	}
@@ -586,11 +680,11 @@ function normalizeTargetList(input) {
 		.map((t, index) => ({ ...t, alias: targetAlias(t, index) }));
 }
 
-// Пуш журнала во ВСЕ настроенные цели. Цели независимы: свой курсор, своя
-// область, своё состояние — падение одной не отменяет остальные.
+// Пуш журнала во ВСЕ настроенные цели. Цели независимы: свои курсоры, свои
+// области, своё состояние — падение одной не отменяет остальные.
 // Результат:
 //   {pushed: <сумма>, lastSeq: <курсор первой цели>, targets: [{alias, url,
-//    journalId, workspaceId, pushed, lastSeq, error}]}
+//    journalId, workspaces, pushed, lastSeq, error}]}
 // error верхнего уровня появляется, только если НИ ОДНА цель не отработала:
 // иначе «ошибка» соврала бы про доехавшие цели (их видно в targets).
 export async function pushJournal({ dbPath, config, targets, env = process.env, log = () => {} }) {
@@ -613,7 +707,7 @@ export async function pushJournal({ dbPath, config, targets, env = process.env, 
 			alias: target.alias,
 			url: target.url,
 			journalId: target.journalId,
-			workspaceId: result.workspaceId ?? null,
+			workspaces: result.workspaces ?? [],
 			pushed: result.pushed ?? 0,
 			lastSeq: result.lastSeq,
 			...(result.error ? { error: result.error } : {}),

@@ -1,7 +1,10 @@
 // Тесты пушера синка workhorse → облако Workhorse AI.
-// Облако — in-process мок на node:http (контракт journal-sync: GET курсор,
-// POST батч, идемпотентность по seq, auth Authorization: Bearer <token>).
-// Никакой сети наружу: только 127.0.0.1 c портом от ОС.
+// Облако — in-process мок на node:http (контракт journal-sync: GET список
+// пространств пользователя с курсорами, POST батч с workspaceId и проверкой
+// членства, идемпотентность по seq, auth Authorization: Bearer <token>).
+// Токен ЛИЧНЫЙ (модель PAT): один токен покрывает все пространства
+// пользователя, журнал раскладывается по ним согласно маппингу
+// cloud_workspace_id. Никакой сети наружу: только 127.0.0.1 c портом от ОС.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -25,6 +28,7 @@ import {
 	needsRescan,
 	normalizeBaseUrl,
 	parseSyncProjects,
+	parseWorkspaces,
 	pushJournal,
 	readSyncState,
 	resolveCloudUrl,
@@ -44,7 +48,12 @@ const SYNC_CLI = join(ROOT, "sync.mjs");
 const TOKEN = "test-mcp-token";
 const JOURNAL = "journal-test";
 const WORKSPACE = "ws-alpha";
+const WORKSPACE_SLUG = "alpha-space";
 const OTHER_WORKSPACE = "ws-other";
+const OTHER_WORKSPACE_SLUG = "other-space";
+
+const ALPHA_WS = { id: WORKSPACE, slug: WORKSPACE_SLUG, name: "Alpha" };
+const OTHER_WS = { id: OTHER_WORKSPACE, slug: OTHER_WORKSPACE_SLUG, name: "Other" };
 
 // ============ фикстуры ============
 
@@ -113,9 +122,20 @@ function makeMultiProjectDb(dir, { mappings = {} } = {}) {
 	return dbPath;
 }
 
-// Какие seq реально приняло облако (идемпотентность: повторы не считаются).
-function appliedSeqs(cloud, journalId = JOURNAL) {
-	return [...(cloud.state.seen.get(journalId) ?? new Set())].sort((a, b) => a - b);
+function cursorKey(workspaceId, journalId) {
+	return `${workspaceId}|${journalId}`;
+}
+
+// Какие seq реально приняло облако в данном пространстве (идемпотентность:
+// повторы не считаются).
+function appliedSeqs(cloud, { journalId = JOURNAL, workspaceId } = {}) {
+	const wsId = workspaceId ?? cloud.state.workspaces[0]?.id;
+	return [...(cloud.state.seen.get(cursorKey(wsId, journalId)) ?? new Set())].sort((a, b) => a - b);
+}
+
+function cloudCursor(cloud, { journalId = JOURNAL, workspaceId } = {}) {
+	const wsId = workspaceId ?? cloud.state.workspaces[0]?.id;
+	return cloud.state.cursors.get(cursorKey(wsId, journalId)) ?? 0;
 }
 
 function countEvents(dbPath) {
@@ -128,9 +148,18 @@ function countEvents(dbPath) {
 }
 
 // ============ мок облака ============
+//
+// workspaces — пространства пользователя личного токена (контракт GET).
+// legacy — облако старого контракта (GET отвечает {lastSeq}, без workspaces).
+// forbidPostTo — POST в эти пространства отвечает 403 (членство отозвано
+// между GET и POST — сервер проверяет членство на каждый батч).
 
-function startMockCloud(t, { token = TOKEN, workspaceId = WORKSPACE } = {}) {
+function startMockCloud(
+	t,
+	{ token = TOKEN, workspaces = [ALPHA_WS], legacy = false, forbidPostTo = [] } = {},
+) {
 	const state = {
+		workspaces,
 		cursors: new Map(),
 		seen: new Map(),
 		posts: 0,
@@ -139,7 +168,7 @@ function startMockCloud(t, { token = TOKEN, workspaceId = WORKSPACE } = {}) {
 		cursorPath: null,
 		cursorHeaders: null,
 		postPath: null,
-		workspaceId,
+		postedWorkspaceIds: [],
 	};
 	const server = createServer((req, res) => {
 		const url = new URL(req.url, "http://127.0.0.1");
@@ -156,10 +185,14 @@ function startMockCloud(t, { token = TOKEN, workspaceId = WORKSPACE } = {}) {
 			state.cursorHeaders = req.headers;
 			const journalId = url.searchParams.get("journalId");
 			if (!journalId) return send(400, { error: "Missing journalId query parameter" });
-			// Контракт роута: курсор + пространство токена (локально неизвестно).
+			if (legacy) return send(200, { lastSeq: 0, workspaceId: WORKSPACE });
+			// Контракт роута: по элементу на каждое пространство пользователя,
+			// lastSeq — курсор пары (workspace, journal).
 			return send(200, {
-				lastSeq: state.cursors.get(journalId) ?? 0,
-				...(state.workspaceId === null ? {} : { workspaceId: state.workspaceId }),
+				workspaces: state.workspaces.map((ws) => ({
+					...ws,
+					lastSeq: state.cursors.get(cursorKey(ws.id, journalId)) ?? 0,
+				})),
 			});
 		}
 		if (req.method === "POST") {
@@ -168,12 +201,18 @@ function startMockCloud(t, { token = TOKEN, workspaceId = WORKSPACE } = {}) {
 			req.on("end", () => {
 				state.posts += 1;
 				state.postPath = url.pathname;
-				const { journalId, events } = JSON.parse(body);
-				if (!journalId || !Array.isArray(events) || events.length === 0)
+				const { workspaceId, journalId, events } = JSON.parse(body);
+				if (!workspaceId || !journalId || !Array.isArray(events) || events.length === 0)
 					return send(400, { error: "Invalid input" });
-				const seen = state.seen.get(journalId) ?? new Set();
-				state.seen.set(journalId, seen);
-				let cursor = state.cursors.get(journalId) ?? 0;
+				state.postedWorkspaceIds.push(workspaceId);
+				// Членство проверяется на каждый батч: чужое пространство — 403.
+				const member = state.workspaces.some((ws) => ws.id === workspaceId);
+				if (!member || forbidPostTo.includes(workspaceId))
+					return send(403, { error: "Not a member of this workspace" });
+				const k = cursorKey(workspaceId, journalId);
+				const seen = state.seen.get(k) ?? new Set();
+				state.seen.set(k, seen);
+				let cursor = state.cursors.get(k) ?? 0;
 				let applied = 0;
 				let skipped = 0;
 				for (const e of events) {
@@ -189,7 +228,7 @@ function startMockCloud(t, { token = TOKEN, workspaceId = WORKSPACE } = {}) {
 					applied += 1;
 					if (e.seq > cursor) cursor = e.seq;
 				}
-				state.cursors.set(journalId, cursor);
+				state.cursors.set(k, cursor);
 				send(200, { applied, skipped, lastSeq: cursor });
 			});
 			return;
@@ -237,6 +276,7 @@ function cleanEnv(extra = {}) {
 		"WORKHORSE_SYNC_TOKEN",
 		"WORKHORSE_SYNC_JOURNAL_ID",
 		"WORKHORSE_SYNC_CONFIG",
+		"WORKHORSE_SYNC_PROJECTS",
 		"WORKHORSE_DB",
 	])
 		delete env[k];
@@ -405,9 +445,29 @@ test("defaultJournalId: <username>-<hostname>, нормализация в [a-z0
 	assert.match(defaultJournalId(), /^[a-z0-9-]+$/, "реальные username/hostname нормализуются");
 });
 
+// ============ parseWorkspaces ============
+
+test("parseWorkspaces: валидный список, дефолты slug/name, брак → null", () => {
+	assert.deepEqual(
+		parseWorkspaces({
+			workspaces: [{ id: "ws-1", slug: "one", name: "One", lastSeq: 3 }],
+		}),
+		[{ id: "ws-1", slug: "one", name: "One", lastSeq: 3 }],
+	);
+	// slug/name опциональны — id всегда есть
+	assert.deepEqual(parseWorkspaces({ workspaces: [{ id: "ws-1", lastSeq: 0 }] }), [
+		{ id: "ws-1", slug: "ws-1", name: "", lastSeq: 0 },
+	]);
+	assert.deepEqual(parseWorkspaces({ workspaces: [] }), []);
+	// Старый контракт ({lastSeq, workspaceId}) — несовместим, это ошибка.
+	assert.equal(parseWorkspaces({ lastSeq: 5, workspaceId: "ws-1" }), null);
+	assert.equal(parseWorkspaces({ workspaces: [{ id: "ws-1", lastSeq: -1 }] }), null);
+	assert.equal(parseWorkspaces({ workspaces: [{ lastSeq: 0 }] }), null);
+});
+
 // Результат pushJournal — агрегат по целям: {pushed, lastSeq, targets: [...]}.
-// Для одной цели сумма совпадает с её собственными числами — это и проверяем
-// (многоцелевые ожидания живут в тестах про несколько целей ниже).
+// Для одной цели с одним пространством сумма совпадает с её собственными
+// числами — это и проверяем.
 function assertOneTarget(result, { pushed, lastSeq }) {
 	assert.equal(result.pushed, pushed, "суммарно отправлено");
 	assert.equal(result.lastSeq, lastSeq, "курсор");
@@ -429,8 +489,9 @@ test("pushJournal: полный пуш с нуля, повтор, докат", a
 	// полный пуш с нуля
 	let r = await pushJournal({ dbPath, config });
 	assertOneTarget(r, { pushed: 10, lastSeq: 10 });
-	assert.equal(cloud.state.cursors.get(JOURNAL), 10);
+	assert.equal(cloudCursor(cloud), 10);
 	assert.equal(cloud.state.lastAuth, `Bearer ${TOKEN}`, "заголовок Authorization: Bearer <token>");
+	assert.deepEqual(cloud.state.postedWorkspaceIds, [WORKSPACE], "POST называет пространство");
 
 	// повторный пуш — нечего отправлять
 	r = await pushJournal({ dbPath, config });
@@ -445,7 +506,7 @@ test("pushJournal: полный пуш с нуля, повтор, докат", a
 
 	r = await pushJournal({ dbPath, config });
 	assertOneTarget(r, { pushed: 3, lastSeq: 13 });
-	assert.equal(cloud.state.cursors.get(JOURNAL), 13);
+	assert.equal(cloudCursor(cloud), 13);
 });
 
 test("pushJournal: батчи по 200 (несколько POST)", async (t) => {
@@ -496,6 +557,36 @@ test("pushJournal: без конфига выключен, неполный ко
 	assert.deepEqual(r, { pushed: 0, disabled: true, targets: [] });
 	r = await pushJournal({ dbPath, config: { url: "http://127.0.0.1:1" } });
 	assert.match(r.error, /неполный/);
+});
+
+test("pushJournal: облако старого контракта (без workspaces) → понятная ошибка", async (t) => {
+	const dir = tmpDir();
+	const dbPath = makeJournalDb(dir);
+	const cloud = await startMockCloud(t, { legacy: true });
+
+	const r = await pushJournal({
+		dbPath,
+		config: { url: cloud.url, token: TOKEN, journalId: JOURNAL },
+	});
+	assert.match(r.error, /не вернуло workspaces/);
+	assert.equal(cloud.state.posts, 0, "ничего не отправлено");
+});
+
+test("pushJournal: у пользователя нет пространств → 0 событий, не ошибка", async (t) => {
+	const dir = tmpDir();
+	const dbPath = makeJournalDb(dir);
+	const cloud = await startMockCloud(t, { workspaces: [] });
+	const lines = [];
+
+	const r = await pushJournal({
+		dbPath,
+		config: { url: cloud.url, token: TOKEN, journalId: JOURNAL },
+		log: (line) => lines.push(line),
+	});
+	assert.equal(r.pushed, 0);
+	assert.equal(r.error, undefined);
+	assert.deepEqual(r.targets[0].workspaces, []);
+	assert.ok(lines.some((line) => /нет пространств/.test(line)));
 });
 
 // ============ CLI ============
@@ -605,16 +696,13 @@ test("авто-пуш: запись события уезжает в облак�
 	let r = await c.tool("register_project", { name: "auto", root_path: "/tmp/auto" });
 	assert.equal(r.ok, true);
 	assert.ok(
-		await waitFor(() => (cloud.state.cursors.get(JOURNAL) ?? 0) >= 1),
+		await waitFor(() => cloudCursor(cloud) >= 1),
 		"ProjectRegistered доехал без вызова sync",
 	);
 
 	r = await c.tool("draft_task", { project: "auto", slug: "one", title: "т", task_text: "x" });
 	assert.equal(r.ok, true);
-	assert.ok(
-		await waitFor(() => (cloud.state.cursors.get(JOURNAL) ?? 0) >= 2),
-		"TaskDrafted доехал авто-пушем",
-	);
+	assert.ok(await waitFor(() => cloudCursor(cloud) >= 2), "TaskDrafted доехал авто-пушем");
 });
 
 test("авто-пуш: недоступное облако не блокирует и не роняет запись", async (t) => {
@@ -646,7 +734,7 @@ test("авто-пуш: недоступное облако не блокируе
 
 // ============ MCP-инструмент connect ============
 
-test("MCP connect: успех → sync.json написан рядом с базой, ответ с курсором", async (t) => {
+test("MCP connect: успех → sync.json написан рядом с базой, ответ с пространствами", async (t) => {
 	const dir = tmpDir();
 	const dbPath = makeJournalDb(dir); // 10 событий
 	const configPath = join(dir, "sync.json");
@@ -658,7 +746,10 @@ test("MCP connect: успех → sync.json написан рядом с баз�
 		token: TOKEN,
 		journal_id: "my-journal",
 	});
-	assert.equal(r.text, `подключено: курсор 0, журнал my-journal, конфиг ${configPath}`);
+	assert.equal(
+		r.text,
+		`подключено: журнал my-journal, пространства: ${WORKSPACE_SLUG} (курсор 0), конфиг ${configPath}`,
+	);
 	assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
 		url: cloud.baseUrl,
 		token: TOKEN,
@@ -667,13 +758,13 @@ test("MCP connect: успех → sync.json написан рядом с баз�
 
 	// connect сразу пинает авто-пуш: накопленный журнал уезжает без ручного sync
 	assert.ok(
-		await waitFor(() => (cloud.state.cursors.get("my-journal") ?? 0) >= 10),
+		await waitFor(() => cloudCursor(cloud, { journalId: "my-journal" }) >= 10),
 		"события доехали после connect",
 	);
 
 	// повторный connect — осознанная перезапись конфига
 	const r2 = await c.tool("connect", { url: cloud.url, token: TOKEN, journal_id: "other-journal" });
-	assert.match(r2.text, /^подключено: курсор 0, журнал other-journal/);
+	assert.match(r2.text, /^подключено: журнал other-journal/);
 	assert.equal(JSON.parse(readFileSync(configPath, "utf8")).journalId, "other-journal");
 });
 
@@ -695,6 +786,18 @@ test("MCP connect: плохой токен → 401, конфиг НЕ запис
 	assert.equal(existsSync(configPath), false);
 });
 
+test("MCP connect: облако старого контракта → не подключено, конфиг не записан", async (t) => {
+	const dir = tmpDir();
+	const dbPath = makeJournalDb(dir);
+	const configPath = join(dir, "sync.json");
+	const cloud = await startMockCloud(t, { legacy: true });
+	const c = startMcp(t, cleanEnv({ WORKHORSE_DB: dbPath }));
+
+	const r = await c.tool("connect", { url: cloud.url, token: TOKEN, journal_id: "j" });
+	assert.match(r.text, /^не подключено: облако не вернуло workspaces/);
+	assert.equal(existsSync(configPath), false);
+});
+
 test("MCP connect: дефолтный journal_id — нормализованный <username>-<hostname>", async (t) => {
 	const dir = tmpDir();
 	const dbPath = makeJournalDb(dir);
@@ -704,7 +807,7 @@ test("MCP connect: дефолтный journal_id — нормализованн�
 
 	const expected = defaultJournalId();
 	const r = await c.tool("connect", { url: cloud.url, token: TOKEN });
-	assert.match(r.text, new RegExp(`^подключено: курсор 0, журнал ${expected},`));
+	assert.match(r.text, new RegExp(`^подключено: журнал ${expected},`));
 	const written = JSON.parse(readFileSync(configPath, "utf8"));
 	assert.equal(written.journalId, expected);
 	assert.match(written.journalId, /^[a-z0-9-]+$/, "id нормализован");
@@ -780,7 +883,7 @@ test("pushJournal: работает от базы и просит не кеши�
 		"GET курсора ушёл на выведенный путь",
 	);
 	assert.equal(cloud.state.postPath, "/api/mcp/journal-sync", "POST батча тоже");
-	// Кеширующий прокси перед on-premise вернул бы устаревший lastSeq —
+	// Кеширующий прокси перед on-premise вернул бы устаревшие lastSeq —
 	// и пушер погнал бы уже отправленные события заново.
 	assert.equal(cloud.state.cursorHeaders["cache-control"], "no-store");
 });
@@ -798,7 +901,7 @@ test("resolveCloudUrl: без url — управляемое облако, env �
 	);
 });
 
-// ============ Область синка: какие проекты уезжают в пространство ============
+// ============ Область синка: какие проекты в какое пространство уезжают ============
 
 test("eventProject: проект события выводится для каждого типа", () => {
 	// payload.project — источник для артефактов и постановок
@@ -850,41 +953,69 @@ test("parseSyncProjects: список через запятую, пустая с
 	assert.equal(parseSyncProjects(undefined), null);
 });
 
-test("resolveSyncScope: env > маппинг > всё-с-предупреждением", () => {
+test("resolveSyncScope: env (одно пространство) > маппинг > всё-с-предупреждением", () => {
 	const projects = [
 		{ name: "alpha", cloud_workspace_id: WORKSPACE },
 		{ name: "beta", cloud_workspace_id: OTHER_WORKSPACE },
 	];
 
-	// 1. env — явное намерение человека, перекрывает маппинг
+	// 1. env — явное намерение человека при ЕДИНСТВЕННОМ пространстве
 	const byEnv = resolveSyncScope({
 		env: { WORKHORSE_SYNC_PROJECTS: "beta" },
 		projects,
 		workspaceId: WORKSPACE,
+		workspaceCount: 1,
 	});
 	assert.deepEqual([...byEnv.projects], ["beta"]);
 	assert.equal(byEnv.source, "env");
 
-	// 2. маппинг на пространство токена
+	// 2. маппинг на конкретное пространство
 	const byMapping = resolveSyncScope({ env: {}, projects, workspaceId: WORKSPACE });
 	assert.deepEqual([...byMapping.projects], ["alpha"]);
 	assert.equal(byMapping.source, "mapping");
 	assert.equal(byMapping.warning, null);
 
-	// 3. маппинга нет ни у кого → всё, но громко
+	// 3. маппинга нет ни у кого, пространство одно → всё, но громко
 	const none = resolveSyncScope({
 		env: {},
 		projects: [{ name: "alpha", cloud_workspace_id: null }],
 		workspaceId: WORKSPACE,
+		workspaceCount: 1,
 	});
 	assert.equal(none.projects, null);
 	assert.equal(none.source, "all");
 	assert.match(none.warning, /ни у одного проекта нет cloud_workspace_id/);
+});
 
-	// 4. маппинг есть, но облако не назвало пространство (старый сервер) → всё
-	const blind = resolveSyncScope({ env: {}, projects, workspaceId: null });
-	assert.equal(blind.projects, null);
-	assert.match(blind.warning, /не сообщило id пространства/);
+test("resolveSyncScope: несколько пространств — env игнорируется, без маппинга не едет ничего", () => {
+	const projects = [
+		{ name: "alpha", cloud_workspace_id: WORKSPACE },
+		{ name: "beta", cloud_workspace_id: null },
+	];
+
+	// env при нескольких пространствах не применяется: адресат неоднозначен.
+	const envIgnored = resolveSyncScope({
+		env: { WORKHORSE_SYNC_PROJECTS: "beta" },
+		projects,
+		workspaceId: WORKSPACE,
+		workspaceCount: 2,
+	});
+	assert.equal(envIgnored.source, "mapping", "решает маппинг, не env");
+	assert.deepEqual([...envIgnored.projects], ["alpha"]);
+	assert.match(envIgnored.warning, /WORKHORSE_SYNC_PROJECTS игнорируется/);
+
+	// маппинга нет ни у одного проекта и пространств несколько → пустая
+	// область (не уедет НИЧЕГО) с просьбой sync_scope: приватность важнее.
+	const unmapped = resolveSyncScope({
+		env: {},
+		projects: [{ name: "alpha", cloud_workspace_id: null }],
+		workspaceId: WORKSPACE,
+		workspaceCount: 2,
+	});
+	assert.deepEqual([...unmapped.projects], []);
+	assert.equal(unmapped.source, "unmapped");
+	assert.match(unmapped.warning, /НИКУДА не уедет/);
+	assert.match(unmapped.warning, /sync_scope/);
 });
 
 test("shouldSyncEvent: общее и ProjectRegistered при активной области не уезжают", () => {
@@ -917,7 +1048,7 @@ test("shouldSyncEvent: общее и ProjectRegistered при активной �
 	);
 });
 
-test("pushJournal: WORKHORSE_SYNC_PROJECTS ограничивает область", async (t) => {
+test("pushJournal: WORKHORSE_SYNC_PROJECTS ограничивает область (одно пространство)", async (t) => {
 	const dir = tmpDir();
 	const dbPath = makeMultiProjectDb(dir);
 	const cloud = await startMockCloud(t);
@@ -934,7 +1065,33 @@ test("pushJournal: WORKHORSE_SYNC_PROJECTS ограничивает област
 	assert.deepEqual(appliedSeqs(cloud), [3, 4, 8]);
 });
 
-test("pushJournal: фильтр по cloud_workspace_id пространства токена", async (t) => {
+test("pushJournal: WORKHORSE_SYNC_PROJECTS при двух пространствах игнорируется с предупреждением", async (t) => {
+	const dir = tmpDir();
+	const dbPath = makeMultiProjectDb(dir, {
+		mappings: { alpha: WORKSPACE, beta: OTHER_WORKSPACE },
+	});
+	const cloud = await startMockCloud(t, { workspaces: [ALPHA_WS, OTHER_WS] });
+	const lines = [];
+
+	const r = await pushJournal({
+		dbPath,
+		env: { WORKHORSE_SYNC_PROJECTS: "beta" },
+		config: { url: cloud.baseUrl, token: TOKEN, journalId: JOURNAL },
+		log: (line) => lines.push(line),
+	});
+
+	// env называет проекты, но не адресата — решает маппинг: alpha → первое
+	// пространство, beta → второе, как если бы env не было.
+	assert.equal(r.pushed, 5);
+	assert.deepEqual(appliedSeqs(cloud, { workspaceId: WORKSPACE }), [3, 4, 8]);
+	assert.deepEqual(appliedSeqs(cloud, { workspaceId: OTHER_WORKSPACE }), [5, 6]);
+	assert.ok(
+		lines.some((line) => /WORKHORSE_SYNC_PROJECTS игнорируется/.test(line)),
+		"молча игнорировать env нельзя",
+	);
+});
+
+test("pushJournal: фильтр по маппингу cloud_workspace_id", async (t) => {
 	const dir = tmpDir();
 	const dbPath = makeMultiProjectDb(dir, {
 		mappings: { alpha: WORKSPACE, beta: OTHER_WORKSPACE },
@@ -951,7 +1108,7 @@ test("pushJournal: фильтр по cloud_workspace_id пространства
 	assert.deepEqual(appliedSeqs(cloud), [3, 4, 8], "beta привязан к другому пространству");
 });
 
-test("pushJournal: маппинга нет ни у одного проекта → едет всё + предупреждение", async (t) => {
+test("pushJournal: маппинга нет, пространство одно → едет всё + предупреждение", async (t) => {
 	const dir = tmpDir();
 	const dbPath = makeMultiProjectDb(dir);
 	const cloud = await startMockCloud(t);
@@ -964,13 +1121,32 @@ test("pushJournal: маппинга нет ни у одного проекта �
 		log: (line) => lines.push(line),
 	});
 
-	assert.equal(r.pushed, 8, "обратная совместимость: поведение до 0.9");
+	assert.equal(r.pushed, 8, "одно пространство — поведение как раньше");
 	assert.deepEqual(appliedSeqs(cloud), [1, 2, 3, 4, 5, 6, 7, 8]);
 	assert.ok(
 		lines.some((line) => /ни у одного проекта нет cloud_workspace_id/.test(line)),
 		"молча всё слать нельзя — в логе предупреждение",
 	);
 	assert.equal(existsSync(syncStatePath({ dbPath })), false, "без области файл состояния не нужен");
+});
+
+test("pushJournal: маппинга нет, пространств НЕСКОЛЬКО → не уезжает ничего + просьба sync_scope", async (t) => {
+	const dir = tmpDir();
+	const dbPath = makeMultiProjectDb(dir);
+	const cloud = await startMockCloud(t, { workspaces: [ALPHA_WS, OTHER_WS] });
+	const lines = [];
+
+	const r = await pushJournal({
+		dbPath,
+		env: {},
+		config: { url: cloud.baseUrl, token: TOKEN, journalId: JOURNAL },
+		log: (line) => lines.push(line),
+	});
+
+	assert.equal(r.pushed, 0, "приватность важнее удобства: адресат неизвестен");
+	assert.equal(cloud.state.posts, 0, "ни одного POST");
+	assert.ok(lines.some((line) => /НИКУДА не уедет/.test(line)));
+	assert.ok(lines.some((line) => /sync_scope/.test(line)));
 });
 
 test("pushJournal: маппинг есть, но ни один не на это пространство → не уезжает ничего", async (t) => {
@@ -990,21 +1166,131 @@ test("pushJournal: маппинг есть, но ни один не на это 
 	assert.equal(cloud.state.posts, 0, "пустой батч не отправляется");
 });
 
-test("pushJournal: облако без workspaceId (старый сервер) не ломает синк", async (t) => {
+// ============ Один токен — два пространства ============
+
+test("один токен, два пространства: проекты разъезжаются по маппингу, курсоры независимы", async (t) => {
 	const dir = tmpDir();
-	const dbPath = makeMultiProjectDb(dir, { mappings: { alpha: WORKSPACE } });
-	const cloud = await startMockCloud(t, { workspaceId: null });
-	const lines = [];
+	const dbPath = makeMultiProjectDb(dir, {
+		mappings: { alpha: WORKSPACE, beta: OTHER_WORKSPACE },
+	});
+	const cloud = await startMockCloud(t, { workspaces: [ALPHA_WS, OTHER_WS] });
+	const config = { url: cloud.baseUrl, token: TOKEN, journalId: JOURNAL };
+
+	const r = await pushJournal({ dbPath, env: {}, config });
+	assert.equal(r.pushed, 5, "3 события alpha + 2 события beta");
+	assert.deepEqual(
+		r.targets[0].workspaces.map((ws) => [ws.slug, ws.pushed, ws.lastSeq]),
+		[
+			[WORKSPACE_SLUG, 3, 8],
+			[OTHER_WORKSPACE_SLUG, 2, 6],
+		],
+	);
+	assert.deepEqual(appliedSeqs(cloud, { workspaceId: WORKSPACE }), [3, 4, 8]);
+	assert.deepEqual(appliedSeqs(cloud, { workspaceId: OTHER_WORKSPACE }), [5, 6]);
+	// Курсоры независимы: на пару (пространство, журнал).
+	assert.equal(cloudCursor(cloud, { workspaceId: WORKSPACE }), 8);
+	assert.equal(cloudCursor(cloud, { workspaceId: OTHER_WORKSPACE }), 6);
+	// Состояние области — по пространствам, ключ = id пространства.
+	const state = JSON.parse(readFileSync(syncStatePath({ dbPath }), "utf8"));
+	assert.deepEqual(state.targets[WORKSPACE].projects, ["alpha"]);
+	assert.deepEqual(state.targets[OTHER_WORKSPACE].projects, ["beta"]);
+
+	// Повторный пуш — нечего отправлять ни в одно пространство.
+	const again = await pushJournal({ dbPath, env: {}, config });
+	assert.equal(again.pushed, 0);
+});
+
+test("один токен, два пространства: 403 одного пространства не мешает другому", async (t) => {
+	const dir = tmpDir();
+	const dbPath = makeMultiProjectDb(dir, {
+		mappings: { alpha: WORKSPACE, beta: OTHER_WORKSPACE },
+	});
+	// Членство в первом пространстве отозвано между GET и POST — сервер
+	// отвечает 403 на батч, второе пространство едет как ни в чём не бывало.
+	const cloud = await startMockCloud(t, {
+		workspaces: [ALPHA_WS, OTHER_WS],
+		forbidPostTo: [WORKSPACE],
+	});
 
 	const r = await pushJournal({
 		dbPath,
 		env: {},
 		config: { url: cloud.baseUrl, token: TOKEN, journalId: JOURNAL },
-		log: (line) => lines.push(line),
 	});
 
-	assert.equal(r.pushed, 8, "сузить не по чему — поведение не меняем");
-	assert.ok(lines.some((line) => /не сообщило id пространства/.test(line)));
+	const [target] = r.targets;
+	assert.match(target.workspaces[0].error, /403/);
+	assert.equal(target.workspaces[1].error, undefined);
+	assert.deepEqual(appliedSeqs(cloud, { workspaceId: OTHER_WORKSPACE }), [5, 6]);
+	assert.equal(r.error, undefined, "часть пространств доехала — общей ошибки нет");
+});
+
+test("один токен, два пространства: расширение области одного не трогает курсор другого", async (t) => {
+	const dir = tmpDir();
+	const dbPath = makeMultiProjectDb(dir, {
+		mappings: { alpha: WORKSPACE, beta: OTHER_WORKSPACE },
+	});
+	const cloud = await startMockCloud(t, { workspaces: [ALPHA_WS, OTHER_WS] });
+	const config = { url: cloud.baseUrl, token: TOKEN, journalId: JOURNAL };
+
+	await pushJournal({ dbPath, env: {}, config });
+	const postsBefore = cloud.state.posts;
+
+	// beta переезжает в первое пространство: у первого область расширилась,
+	// у второго — сузилась.
+	const { db, raw } = openDb(dbPath);
+	raw("_general", "ProjectRegistered", {
+		name: "beta",
+		root_path: "/tmp/beta",
+		cloud_workspace_id: WORKSPACE,
+	});
+	db.close();
+
+	const lines = [];
+	await pushJournal({ dbPath, env: {}, config, log: (line) => lines.push(line) });
+
+	assert.ok(
+		lines.some((line) =>
+			new RegExp(`^\\{${WORKSPACE_SLUG}\\}.*пересинхронизация с нуля`).test(line),
+		),
+		"расширенное пространство идёт с нуля",
+	);
+	assert.ok(
+		!lines.some((line) =>
+			new RegExp(`^\\{${OTHER_WORKSPACE_SLUG}\\}.*пересинхронизация`).test(line),
+		),
+		"второе пространство чужое расширение не касается",
+	);
+	assert.deepEqual(
+		appliedSeqs(cloud, { workspaceId: WORKSPACE }),
+		[3, 4, 5, 6, 8],
+		"beta догнал в первом пространстве",
+	);
+	// Во второе пространство новых событий не уезжало: только событие
+	// перерегистрации beta там отфильтровано (ProjectRegistered не едет).
+	assert.deepEqual(appliedSeqs(cloud, { workspaceId: OTHER_WORKSPACE }), [5, 6]);
+	assert.ok(cloud.state.posts > postsBefore, "первый догонял постами");
+});
+
+test("CLI: env-конфиг без sync.json покрывает оба пространства одним токеном", async (t) => {
+	const dir = tmpDir();
+	const dbPath = makeMultiProjectDb(dir, {
+		mappings: { alpha: WORKSPACE, beta: OTHER_WORKSPACE },
+	});
+	const cloud = await startMockCloud(t, { workspaces: [ALPHA_WS, OTHER_WS] });
+
+	const { code, stdout } = await runCli(
+		cleanEnv({
+			WORKHORSE_DB: dbPath,
+			WORKHORSE_SYNC_URL: cloud.baseUrl,
+			WORKHORSE_SYNC_TOKEN: TOKEN,
+			WORKHORSE_SYNC_JOURNAL_ID: JOURNAL,
+		}),
+	);
+	assert.equal(code, 0);
+	assert.match(stdout, /отправлено 5/);
+	assert.deepEqual(appliedSeqs(cloud, { workspaceId: WORKSPACE }), [3, 4, 8]);
+	assert.deepEqual(appliedSeqs(cloud, { workspaceId: OTHER_WORKSPACE }), [5, 6]);
 });
 
 // ============ Курсор при смене области ============
@@ -1016,7 +1302,7 @@ test("курсор: расширение области → пересинхро
 	const config = { url: cloud.baseUrl, token: TOKEN, journalId: JOURNAL };
 
 	// Область = alpha: курсор облака уезжает на 8, события beta (5,6) остаются
-	// ПОЗАДИ курсора — общий курсор один на журнал.
+	// ПОЗАДИ курсора — курсор пары (пространство, журнал) один.
 	let r = await pushJournal({ dbPath, env: { WORKHORSE_SYNC_PROJECTS: "alpha" }, config });
 	assert.deepEqual(appliedSeqs(cloud), [3, 4, 8]);
 	assert.equal(r.lastSeq, 8);
@@ -1068,7 +1354,7 @@ test("курсор: апгрейд со старой версии (состоя�
 
 // ============ MCP-инструмент sync_scope ============
 
-test("MCP sync_scope: показывает область и привязывает проекты к пространству", async (t) => {
+test("MCP sync_scope: показывает область по пространствам и привязывает проекты", async (t) => {
 	const dir = tmpDir();
 	const dbPath = join(dir, "journal.db");
 	const cloud = await startMockCloud(t);
@@ -1081,11 +1367,11 @@ test("MCP sync_scope: показывает область и привязыва�
 	// без аргументов — честный отчёт: область не задана, уедет всё
 	const before = await c.tool("sync_scope", {});
 	assert.match(before.text, /ВСЕ проекты/);
+	assert.match(before.text, new RegExp(`- ${WORKSPACE_SLUG}:`), "пространство названо slug'ом");
 
-	// с projects — маппинг проставляется сам, id пространства спрашивается у облака
+	// с projects — маппинг проставляется сам; пространство одно, slug не нужен
 	const set = await c.tool("sync_scope", { projects: ["alpha"] });
-	assert.match(set.text, /область синка: alpha/);
-	assert.match(set.text, new RegExp(WORKSPACE));
+	assert.match(set.text, new RegExp(`- ${WORKSPACE_SLUG}: alpha \\(маппинг`));
 
 	const list = await c.tool("list_projects", {});
 	const byName = Object.fromEntries(list.data.map((p) => [p.name, p.cloud_workspace_id]));
@@ -1095,6 +1381,59 @@ test("MCP sync_scope: показывает область и привязыва�
 	// снятие привязки: снова уедет всё
 	const cleared = await c.tool("sync_scope", { projects: [] });
 	assert.match(cleared.text, /ВСЕ проекты/);
+});
+
+test("MCP sync_scope: два пространства — привязка по slug, без slug — отказ с перечнем", async (t) => {
+	const dir = tmpDir();
+	const dbPath = join(dir, "journal.db");
+	const cloud = await startMockCloud(t, { workspaces: [ALPHA_WS, OTHER_WS] });
+	const c = startMcp(t, cleanEnv({ WORKHORSE_DB: dbPath, WORKHORSE_SCHEMA: SCHEMA }));
+
+	await c.tool("register_project", { name: "alpha", root_path: "/tmp/alpha" });
+	await c.tool("register_project", { name: "beta", root_path: "/tmp/beta", force: true });
+	await c.tool("connect", { url: cloud.baseUrl, token: TOKEN, journal_id: JOURNAL });
+
+	// показ: строка на каждое пространство
+	const before = await c.tool("sync_scope", {});
+	assert.match(before.text, new RegExp(`- ${WORKSPACE_SLUG}:`));
+	assert.match(before.text, new RegExp(`- ${OTHER_WORKSPACE_SLUG}:`));
+
+	// привязка без workspace при двух пространствах — отказ с перечнем slug'ов
+	const ambiguous = await c.tool("sync_scope", { projects: ["alpha"] });
+	assert.equal(ambiguous.ok, false);
+	assert.match(
+		ambiguous.error,
+		new RegExp(`укажи workspace: ${WORKSPACE_SLUG}, ${OTHER_WORKSPACE_SLUG}`),
+	);
+
+	// несуществующий slug — отказ с перечнем
+	const unknown = await c.tool("sync_scope", { workspace: "ghost", projects: ["alpha"] });
+	assert.equal(unknown.ok, false);
+	assert.match(unknown.error, /Пространство «ghost» не найдено/);
+
+	// привязка по slug: alpha → первое, beta → второе
+	const boundA = await c.tool("sync_scope", { workspace: WORKSPACE_SLUG, projects: ["alpha"] });
+	assert.match(boundA.text, new RegExp(`- ${WORKSPACE_SLUG}: alpha`));
+	const boundB = await c.tool("sync_scope", {
+		workspace: OTHER_WORKSPACE_SLUG,
+		projects: ["beta"],
+	});
+	assert.match(boundB.text, new RegExp(`- ${OTHER_WORKSPACE_SLUG}: beta`));
+	assert.match(
+		boundB.text,
+		new RegExp(`- ${WORKSPACE_SLUG}: alpha`),
+		"привязка второго пространства не сняла первое",
+	);
+
+	const list = await c.tool("list_projects", {});
+	const byName = Object.fromEntries(list.data.map((p) => [p.name, p.cloud_workspace_id]));
+	assert.equal(byName.alpha, WORKSPACE);
+	assert.equal(byName.beta, OTHER_WORKSPACE);
+
+	// и после привязки sync раскладывает журнал по пространствам
+	const synced = await c.tool("sync", {});
+	assert.match(synced.text, new RegExp(`- ${WORKSPACE_SLUG}: отправлено`));
+	assert.match(synced.text, new RegExp(`- ${OTHER_WORKSPACE_SLUG}: отправлено`));
 });
 
 test("MCP sync_scope: незарегистрированный проект — ошибка, журнал не трогаем", async (t) => {
@@ -1125,6 +1464,22 @@ test("MCP connect: несколько проектов без области —
 	assert.match(r.text, /sync_scope/);
 });
 
+test("MCP connect: несколько пространств без маппинга — предупреждение «никуда не поедет»", async (t) => {
+	const dir = tmpDir();
+	const dbPath = join(dir, "journal.db");
+	const cloud = await startMockCloud(t, { workspaces: [ALPHA_WS, OTHER_WS] });
+	const c = startMcp(t, cleanEnv({ WORKHORSE_DB: dbPath, WORKHORSE_SCHEMA: SCHEMA }));
+
+	await c.tool("register_project", { name: "alpha", root_path: "/tmp/alpha" });
+
+	const r = await c.tool("connect", { url: cloud.baseUrl, token: TOKEN, journal_id: JOURNAL });
+	assert.match(r.text, /^подключено/);
+	assert.match(r.text, new RegExp(`${WORKSPACE_SLUG} \\(курсор 0\\)`));
+	assert.match(r.text, new RegExp(`${OTHER_WORKSPACE_SLUG} \\(курсор 0\\)`));
+	assert.match(r.text, /НИКУДА не поедет/);
+	assert.match(r.text, /sync_scope \{ workspace: <slug>, projects: \[\.\.\.\] \}/);
+});
+
 test("MCP connect: без url подключается к облаку по умолчанию", async (t) => {
 	const dir = tmpDir();
 	const dbPath = makeJournalDb(dir);
@@ -1136,7 +1491,10 @@ test("MCP connect: без url подключается к облаку по ум
 
 	const r = await c.tool("connect", { token: TOKEN, journal_id: "default-cloud" });
 
-	assert.equal(r.text, `подключено: курсор 0, журнал default-cloud, конфиг ${configPath}`);
+	assert.equal(
+		r.text,
+		`подключено: журнал default-cloud, пространства: ${WORKSPACE_SLUG} (курсор 0), конфиг ${configPath}`,
+	);
 	assert.equal(cloud.state.cursorPath, "/api/mcp/journal-sync");
 	const cfg = JSON.parse(readFileSync(configPath, "utf8"));
 	assert.equal(cfg.url, cloud.baseUrl, "в конфиг записан фактический адрес, а не пустота");
@@ -1217,7 +1575,7 @@ test("две цели: каждый проект уезжает только в 
 		mappings: { alpha: WORKSPACE, beta: OTHER_WORKSPACE },
 	});
 	const first = await startMockCloud(t);
-	const second = await startMockCloud(t, { workspaceId: OTHER_WORKSPACE });
+	const second = await startMockCloud(t, { workspaces: [OTHER_WS] });
 
 	const r = await pushJournal({
 		dbPath,
@@ -1227,7 +1585,6 @@ test("две цели: каждый проект уезжает только в 
 			{ alias: "second", url: second.baseUrl, token: TOKEN, journalId: JOURNAL },
 		],
 	});
-
 	assert.equal(r.pushed, 5, "3 события alpha + 2 события beta");
 	assert.deepEqual(
 		r.targets.map((x) => [x.alias, x.pushed, x.lastSeq]),
@@ -1239,8 +1596,8 @@ test("две цели: каждый проект уезжает только в 
 	assert.deepEqual(appliedSeqs(first), [3, 4, 8], "в первое пространство только alpha");
 	assert.deepEqual(appliedSeqs(second), [5, 6], "во второе только beta");
 	// Курсоры независимы: у каждой цели свой.
-	assert.equal(first.state.cursors.get(JOURNAL), 8);
-	assert.equal(second.state.cursors.get(JOURNAL), 6);
+	assert.equal(cloudCursor(first), 8);
+	assert.equal(cloudCursor(second), 6);
 	// Состояние области — по целям, ключ = пространство.
 	const state = JSON.parse(readFileSync(syncStatePath({ dbPath }), "utf8"));
 	assert.deepEqual(state.targets[WORKSPACE].projects, ["alpha"]);
@@ -1252,7 +1609,7 @@ test("две цели: недоступность одной не мешает �
 	const dbPath = makeMultiProjectDb(dir, {
 		mappings: { alpha: WORKSPACE, beta: OTHER_WORKSPACE },
 	});
-	const alive = await startMockCloud(t, { workspaceId: OTHER_WORKSPACE });
+	const alive = await startMockCloud(t, { workspaces: [OTHER_WS] });
 	const lines = [];
 
 	const r = await pushJournal({
@@ -1282,7 +1639,7 @@ test("две цели: расширение области у одной не в
 		mappings: { alpha: WORKSPACE, beta: OTHER_WORKSPACE },
 	});
 	const first = await startMockCloud(t);
-	const second = await startMockCloud(t, { workspaceId: OTHER_WORKSPACE });
+	const second = await startMockCloud(t, { workspaces: [OTHER_WS] });
 	const targets = [
 		{ alias: "first", url: first.baseUrl, token: TOKEN, journalId: JOURNAL },
 		{ alias: "second", url: second.baseUrl, token: TOKEN, journalId: JOURNAL },
@@ -1360,14 +1717,14 @@ test("совместимость: плоский sync.json без env — пуш
 	const { code, stdout } = await runCli(cleanEnv({ WORKHORSE_DB: dbPath }));
 	assert.equal(code, 0);
 	assert.match(stdout, /отправлено 10, курсор 10/);
-	assert.equal(cloud.state.cursors.get(JOURNAL), 10);
+	assert.equal(cloudCursor(cloud), 10);
 });
 
 test("MCP: две цели — sync_scope по каждой, привязка по алиасу, sync со сводкой", async (t) => {
 	const dir = tmpDir();
 	const dbPath = join(dir, "journal.db");
 	const acme = await startMockCloud(t);
-	const lab = await startMockCloud(t, { workspaceId: OTHER_WORKSPACE });
+	const lab = await startMockCloud(t, { workspaces: [OTHER_WS] });
 	const c = startMcp(t, cleanEnv({ WORKHORSE_DB: dbPath, WORKHORSE_SCHEMA: SCHEMA }));
 
 	// Проекты и задачи заводим ДО настройки синка: seq 1,2 — ProjectRegistered,
@@ -1387,23 +1744,27 @@ test("MCP: две цели — sync_scope по каждой, привязка п
 		}),
 	);
 
-	// Показ — по всем целям сразу.
+	// Показ — по всем целям сразу, у каждой — пространства пользователя.
 	const before = await c.tool("sync_scope", {});
 	assert.match(before.text, /область синка по целям \(2\)/);
-	assert.match(before.text, /- acme .*ВСЕ проекты/);
-	assert.match(before.text, /- lab .*ВСЕ проекты/);
+	assert.match(before.text, new RegExp(`- acme .*:\\n\\s+- ${WORKSPACE_SLUG}: ВСЕ проекты`));
+	assert.match(before.text, new RegExp(`- lab .*:\\n\\s+- ${OTHER_WORKSPACE_SLUG}: ВСЕ проекты`));
 
 	// Привязка без указания цели при нескольких целях — отказ с перечнем целей.
 	const ambiguous = await c.tool("sync_scope", { projects: ["alpha"] });
 	assert.equal(ambiguous.ok, false);
 	assert.match(ambiguous.error, /укажи target: acme, lab/);
 
-	// Человек называет цель алиасом, id пространства не знает.
+	// Человек называет цель алиасом; пространство у цели одно — slug не нужен.
 	const bound = await c.tool("sync_scope", { target: "acme", projects: ["alpha"] });
-	assert.match(bound.text, /- acme .*: alpha/);
+	assert.match(bound.text, new RegExp(`- ${WORKSPACE_SLUG}: alpha`));
 	const bound2 = await c.tool("sync_scope", { target: "lab", projects: ["beta"] });
-	assert.match(bound2.text, /- lab .*: beta/);
-	assert.match(bound2.text, /- acme .*: alpha/, "привязка второй цели не сняла первую");
+	assert.match(bound2.text, new RegExp(`- ${OTHER_WORKSPACE_SLUG}: beta`));
+	assert.match(
+		bound2.text,
+		new RegExp(`- ${WORKSPACE_SLUG}: alpha`),
+		"привязка второй цели не сняла первую",
+	);
 
 	const list = await c.tool("list_projects", {});
 	const byName = Object.fromEntries(list.data.map((p) => [p.name, p.cloud_workspace_id]));
@@ -1424,7 +1785,7 @@ test("MCP connect: alias добавляет вторую цель, без alias 
 	const dbPath = makeJournalDb(dir);
 	const configPath = join(dir, "sync.json");
 	const first = await startMockCloud(t);
-	const second = await startMockCloud(t, { workspaceId: OTHER_WORKSPACE });
+	const second = await startMockCloud(t, { workspaces: [OTHER_WS] });
 	const c = startMcp(t, cleanEnv({ WORKHORSE_DB: dbPath }));
 
 	await c.tool("connect", { url: first.baseUrl, token: TOKEN, journal_id: "j1" });
@@ -1456,7 +1817,8 @@ test("MCP connect: alias добавляет вторую цель, без alias 
 	assert.ok(
 		await waitFor(
 			() =>
-				(first.state.cursors.get("j1") ?? 0) >= 10 && (second.state.cursors.get("j2") ?? 0) >= 10,
+				cloudCursor(first, { journalId: "j1" }) >= 10 &&
+				cloudCursor(second, { journalId: "j2" }) >= 10,
 		),
 		"журнал уехал в обе цели",
 	);
@@ -1479,10 +1841,7 @@ test("авто-пуш: мёртвая цель — строка в stderr, жи�
 
 	const r = await c.tool("register_project", { name: "auto", root_path: "/tmp/auto" });
 	assert.equal(r.ok, true, "запись проходит, несмотря на мёртвую цель");
-	assert.ok(
-		await waitFor(() => (alive.state.cursors.get(JOURNAL) ?? 0) >= 1),
-		"живая цель получила событие",
-	);
+	assert.ok(await waitFor(() => cloudCursor(alive) >= 1), "живая цель получила событие");
 	assert.ok(
 		await waitFor(() => c.getStderr().includes("авто-пуш синка не прошёл (dead)")),
 		"про мёртвую цель — одна строка в stderr, с её именем",

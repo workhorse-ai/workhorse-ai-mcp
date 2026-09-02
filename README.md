@@ -79,10 +79,13 @@ On first start the server creates the directory and the database itself.
 
 ## Connect to the cloud (optional)
 
-`connect` needs only a token — the managed Workhorse AI cloud is the default:
+`connect` needs only a token — the managed Workhorse AI cloud is the default.
+The token is **personal** (a PAT, like on GitHub): one token covers every
+workspace you are a member of, and the journal is routed between them by
+`sync_scope`:
 
 ```
-connect { "token": "pln_..." }
+connect { "token": "wh_..." }
 ```
 
 ### Self-hosted (on-premise)
@@ -91,8 +94,8 @@ Pass the **base URL** of your instance; endpoint paths are derived by the server
 so a reverse-proxy prefix works as-is:
 
 ```
-connect { "url": "https://workhorse.acme.internal", "token": "pln_..." }
-connect { "url": "https://tools.acme.com/workhorse", "token": "pln_..." }
+connect { "url": "https://workhorse.acme.internal", "token": "wh_..." }
+connect { "url": "https://tools.acme.com/workhorse", "token": "wh_..." }
 ```
 
 The resolved base is stored in `sync.json` next to the database. To point every
@@ -112,7 +115,7 @@ take precedence over the file:
       "args": ["-y", "workhorse-ai-mcp"],
       "env": {
         "WORKHORSE_SYNC_URL": "https://app.workhorse-ai.dev",
-        "WORKHORSE_SYNC_TOKEN": "pln_..."
+        "WORKHORSE_SYNC_TOKEN": "wh_..."
       }
     }
   }
@@ -132,13 +135,13 @@ its own cursor and its own scope:
 ```json
 {
   "targets": [
-    { "alias": "acme", "url": "https://wh.acme.internal", "token": "pln_...", "journalId": "kv-mac" },
-    { "alias": "lab",  "url": "https://app.workhorse-ai.dev", "token": "pln_...", "journalId": "kv-mac" }
+    { "alias": "acme", "url": "https://wh.acme.internal", "token": "wh_...", "journalId": "kv-mac" },
+    { "alias": "lab",  "url": "https://app.workhorse-ai.dev", "token": "wh_...", "journalId": "kv-mac" }
   ]
 }
 ```
 
-`connect { "alias": "lab", "token": "pln_..." }` adds a target instead of
+`connect { "alias": "lab", "token": "wh_..." }` adds a target instead of
 replacing the config. On a flat config without an `alias` it overwrites, exactly
 as before; once a `targets` list exists it replaces only its own entry — matched
 by alias, or by url plus journal id — and leaves the neighbours alone. The
@@ -153,20 +156,26 @@ and a failing one is a line on stderr, never a crash.
 ### Which projects are pushed (sync scope)
 
 The journal is one per machine and holds every project you work on, while a
-cloud workspace belongs to a team. Bind the projects that may go there:
+cloud workspace belongs to a team. The token is personal, so the cloud reports
+every workspace you are a member of, and each push fans the journal out across
+them by the project mapping. Bind projects to a workspace by its **slug**:
 
 ```
-sync_scope {}                            # what would be pushed, and why
-sync_scope { "projects": ["acme-web"] }   # bind these to the connected workspace
+sync_scope {}                                                  # what would be pushed where, and why
+sync_scope { "workspace": "acme", "projects": ["acme-web"] }   # bind these to that workspace
 ```
 
-`sync_scope` asks the cloud for the workspace id itself and records it as
+`sync_scope` asks the cloud for the workspace list itself and records the id as
 `cloud_workspace_id` in the project registry — no manual ids, no SQLite editing.
-With several targets, `sync_scope {}` reports each of them and binding names the
-target by its alias: `sync_scope { "target": "acme", "projects": ["acme-web"] }`.
+With a single workspace the `workspace` argument may be omitted. With several
+targets (servers), binding also names the target by its alias:
+`sync_scope { "target": "acme", "workspace": "team", "projects": ["acme-web"] }`.
 `WORKHORSE_SYNC_PROJECTS="acme-web,acme-api"` overrides the registry for one
-process. With no mapping anywhere the push stays as before — everything goes —
-and warns about it on every run.
+process, but only while you have a single workspace — with several it names the
+projects yet not the destination, so it is ignored with a warning. With no
+mapping anywhere: a single workspace receives everything (with a warning, as
+before); with several workspaces nothing is pushed until you bind projects —
+privacy over convenience.
 
 While a scope is active, events that belong to no project (journal-level
 incidents, `_general`) and `ProjectRegistered` stay local. Widening the scope

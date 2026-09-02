@@ -183,12 +183,15 @@ The journal works fully offline; cloud sync sits on top and changes nothing abou
 the discipline.
 
 - **`connect`** — checks the connection and writes the sync config next to the
-  database. After that every journal write is pushed upstream fire-and-forget.
-- **`sync_scope`** — which projects may reach that workspace. The journal is one
+  database. The token is personal: one token covers every workspace you are a
+  member of. After that every journal write is pushed upstream fire-and-forget.
+- **`sync_scope`** — which projects go to which workspace (by its slug:
+  `sync_scope { workspace: "acme", projects: [...] }`). The journal is one
   per machine and holds every project you work on, so without a scope another
-  team's workspace receives your other clients' tasks. Run `sync_scope {}` right
-  after connecting to see what would be pushed, and bind the projects that belong
-  there.
+  team's workspace could receive your other clients' tasks — with several
+  workspaces and no scope nothing is pushed at all. Run `sync_scope {}` right
+  after connecting to see what would be pushed where, and bind the projects
+  that belong there.
 - **`sync`** — a forced push (strictly one direction: the journal goes up, the cloud
   never rewrites the journal).
 - **`inbox`** / **`take`** — task intents arrive from the cloud: `inbox` shows the

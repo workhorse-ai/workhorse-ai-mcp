@@ -20,6 +20,8 @@ const SERVER = join(ROOT, "server.mjs");
 
 const TOKEN = "test-mcp-token";
 const JOURNAL = "journal-test";
+const WORKSPACE = { id: "ws-alpha", slug: "alpha-space", name: "Alpha" };
+const OTHER_WORKSPACE = { id: "ws-other", slug: "other-space", name: "Other" };
 
 // ============ фикстуры ============
 
@@ -43,6 +45,7 @@ function cleanEnv(extra = {}) {
 
 // ============ мок облака: journal-sync (для авто-пуша) + journal-inbox ============
 
+// Токен личный — каждое намерение несёт пространство (id, slug, name).
 function makeIntent(id, title, featureTitle, extra = {}) {
 	return {
 		id,
@@ -53,17 +56,19 @@ function makeIntent(id, title, featureTitle, extra = {}) {
 			description: extra.featureDescription ?? null,
 			clarifications: extra.clarifications ?? null,
 		},
+		workspace: extra.workspace ?? WORKSPACE,
 		createdAt: "2026-08-30T10:00:00.000Z",
 		...("recommendedSlug" in extra ? { recommendedSlug: extra.recommendedSlug } : {}),
 	};
 }
 
-function startMockCloud(t, { token = TOKEN, items = [] } = {}) {
+function startMockCloud(t, { token = TOKEN, items = [], foreignTaskIds = [] } = {}) {
 	const state = {
 		items: new Map(items.map((item) => [item.id, { ...item, takenAt: null }])),
 		cursor: 0,
 		seen: new Set(),
 		takes: [],
+		foreignTaskIds,
 	};
 	const server = createServer((req, res) => {
 		const url = new URL(req.url, "http://127.0.0.1");
@@ -74,9 +79,11 @@ function startMockCloud(t, { token = TOKEN, items = [] } = {}) {
 		if (req.headers.authorization !== `Bearer ${token}`)
 			return send(401, { error: "Invalid or revoked MCP token" });
 
-		// Контракт journal-sync — чтобы авто-пуш сервера не сыпал ошибками
+		// Контракт journal-sync — чтобы авто-пуш сервера не сыпал ошибками.
+		// Токен личный: GET отдаёт пространства пользователя с курсорами.
 		if (url.pathname.endsWith("/journal-sync")) {
-			if (req.method === "GET") return send(200, { lastSeq: state.cursor });
+			if (req.method === "GET")
+				return send(200, { workspaces: [{ ...WORKSPACE, lastSeq: state.cursor }] });
 			let body = "";
 			req.on("data", (c) => (body += c));
 			req.on("end", () => {
@@ -105,6 +112,10 @@ function startMockCloud(t, { token = TOKEN, items = [] } = {}) {
 			req.on("end", () => {
 				const { taskId } = JSON.parse(body);
 				state.takes.push(taskId);
+				// Чужое намерение: задача существует, но пользователь не участник
+				// её пространства — контракт роута отвечает 403, не 404.
+				if (state.foreignTaskIds.includes(taskId))
+					return send(403, { error: "Not a member of this workspace" });
 				const item = state.items.get(taskId);
 				if (!item) return send(404, { error: "Task not found" });
 				const alreadyTaken = item.takenAt !== null;
@@ -220,7 +231,10 @@ test("inbox: список намерений — счётчик и кратки�
 	const cloud = await startMockCloud(t, {
 		items: [
 			makeIntent("intent-1", "Тёмная тема", "UI-полировка"),
-			makeIntent("intent-2", "Инбокс намерений", "Обратная петля"),
+			// Второе намерение — из другого пространства: инбокс собирает всё.
+			makeIntent("intent-2", "Инбокс намерений", "Обратная петля", {
+				workspace: OTHER_WORKSPACE,
+			}),
 		],
 	});
 	const c = startMcp(t, mcpEnv(dir, cloud.syncUrl));
@@ -231,8 +245,14 @@ test("inbox: список намерений — счётчик и кратки�
 
 	let r = await c.tool("inbox", {});
 	assert.match(r.text, /^2 намерений:/);
-	assert.match(r.text, /- intent-1 — Тёмная тема \(фича: UI-полировка\)/);
-	assert.match(r.text, /- intent-2 — Инбокс намерений \(фича: Обратная петля\)/);
+	assert.match(
+		r.text,
+		/- intent-1 — Тёмная тема \(фича: UI-полировка, пространство: alpha-space\)/,
+	);
+	assert.match(
+		r.text,
+		/- intent-2 — Инбокс намерений \(фича: Обратная петля, пространство: other-space\)/,
+	);
 	assert.match(r.text, /take/);
 
 	// после забора обоих инбокс пуст
@@ -261,6 +281,7 @@ test("take: болванка для draft_task — intent_task_id, контек�
 	let r = await c.tool("take", { task_id: "intent-42" });
 	assert.match(r.text, /Намерение забрано из инбокса/);
 	assert.match(r.text, /intent_task_id: intent-42/);
+	assert.match(r.text, /Пространство: alpha-space/);
 	assert.match(r.text, /## Контекст фичи: UI-полировка/);
 	assert.match(r.text, /Довести визуал до ума/);
 	assert.match(r.text, /Уточнения: Уважать prefers-color-scheme/);
@@ -278,6 +299,17 @@ test("take: болванка для draft_task — intent_task_id, контек�
 	// несуществующее намерение — понятный текст, не исключение
 	r = await c.tool("take", { task_id: "no-such" });
 	assert.equal(r.text, "намерение no-such не найдено в облаке");
+});
+
+test("take: чужое намерение (403 от облака) — отказ текстом, не исключение", async (t) => {
+	const dir = tmpDir();
+	const cloud = await startMockCloud(t, { foreignTaskIds: ["intent-foreign"] });
+	const c = startMcp(t, mcpEnv(dir, cloud.syncUrl));
+
+	const r = await c.tool("take", { task_id: "intent-foreign" });
+	assert.match(r.text, /^ошибка take: HTTP 403/);
+	const alive = await c.tool("list_tasks", {});
+	assert.equal(alive.ok, true, "сервер жив");
 });
 
 // ============ draft_task → payload.intent_task_id ============
